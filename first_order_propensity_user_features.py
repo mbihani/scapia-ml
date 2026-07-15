@@ -29,7 +29,7 @@
 # MAGIC time via `FeatureLookup(feature_names=[...])` on the training set — never by trimming this table.
 # MAGIC
 # MAGIC ## Point-in-time correctness
-# MAGIC This is a **time-series** feature table (`primary_keys=['internal_user_id']`,
+# MAGIC This is a **time-series** feature table (`primary_keys=['internal_user_id', 'feature_ts']`,
 # MAGIC `timeseries_columns=['feature_ts']`). `create_training_set` then performs an *as-of* join keyed on the
 # MAGIC spine's `feature_ts`, structurally preventing the target-leakage the audit flagged.
 # MAGIC
@@ -497,6 +497,7 @@ print(f"Merged {features_df.count():,} rows for feature_ts = {as_of_ts}")
 # MAGIC                 "app_opens_30d",                  # app-engagement count, last 30d
 # MAGIC                 "lounge_used",                    # lounge-ever-used flag
 # MAGIC             ],
+# MAGIC         )
 # MAGIC     ],
 # MAGIC     label="output",
 # MAGIC     exclude_columns=["feature_ts"],            # keep the join key out of the model matrix
