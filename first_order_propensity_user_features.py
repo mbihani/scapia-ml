@@ -72,9 +72,16 @@ SCHEMA = "features"
 TABLE = "first_order_propensity_user_features"
 FEATURE_TABLE = f"{CATALOG}.{SCHEMA}.{TABLE}"
 
-# Entity key (primary key) and feature-timestamp column names.
+# Entity key and feature-timestamp column names.
 ENTITY_KEY = "internal_user_id"   # real entity-key column from the reference notebook
 FEATURE_TS = "feature_ts"          # point-in-time key, derived from the as-of / cutoff date
+
+# Primary key for the time-series feature table. A Databricks time-series table
+# REQUIRES the timeseries column to be part of the primary key, so the PK is the
+# (entity, feature_ts) composite — this is also what lets multiple per-user
+# snapshots (one per as-of date) coexist and merge correctly. Declared once here
+# so the create_table call never hardcodes it independently.
+PRIMARY_KEYS = [ENTITY_KEY, FEATURE_TS]
 
 # --- Source Unity Catalog tables (read-only inputs) -------------------------
 ONBOARDED_USERS_FACT = "simple.crud.onboarded_users_fact"          # card issuance -> onboarding date
@@ -135,6 +142,11 @@ def resolve_as_of_ts(widget_value: str) -> str:
     If the widget is set, use it verbatim (a bare date is read as IST midnight).
     Otherwise reproduce the reference cutoff: the latest qualifying-order time
     (in IST) minus PERFORMANCE_DAYS. Orders is touched ONLY for this default.
+
+    RECOMMENDATION: always pass an explicit `as_of_date` for training runs. The
+    auto-derived default depends on the global latest qualifying-order timestamp,
+    which drifts as new orders arrive — so leaving it blank makes the resulting
+    training set non-reproducible across runs.
     """
     widget_value = (widget_value or "").strip()
     if widget_value:
@@ -169,6 +181,11 @@ print(f"as_of / feature_ts   : {as_of_ts}")
 # MAGIC * **recency-in-days** and **activation_days** stay `NULL` when the event never occurred — absence is
 # MAGIC   `NULL`, not a magic sentinel. The downstream model owns imputation (the reference pipeline maps
 # MAGIC   `NULL` -> the `never` / `inactive` bucket, identical to how it treats its old `9999` sentinel).
+# MAGIC
+# MAGIC **NULL contract (read before consuming):** for the recency (`days_since_last_*`) and `activation_days`
+# MAGIC columns, `NULL` means *"never / not activated"* and is intended to map to the v7 `never` / `inactive`
+# MAGIC buckets in the model pipeline's `bucket_recency` / `bucket_ad` functions. Any downstream consumer that
+# MAGIC expects a literal `9999` sentinel (rather than `NULL`) must impute it itself — the store never writes it.
 
 # COMMAND ----------
 
@@ -378,8 +395,8 @@ except Exception:
 if not table_exists:
     fe.create_table(
         name=FEATURE_TABLE,
-        primary_keys=[ENTITY_KEY],          # entity key only ...
-        timeseries_columns=[FEATURE_TS],    # ... time dimension declared separately -> time-series table
+        primary_keys=PRIMARY_KEYS,          # composite PK = [internal_user_id, feature_ts] (see CONFIG)
+        timeseries_columns=[FEATURE_TS],    # feature_ts is BOTH part of the PK and the time dimension
         schema=features_df.schema,          # create empty with the right schema; data lands via write_table
         description=(
             "Scapia First-Order-Propensity per-user RAW features (counts / balances / recency / timestamps). "
@@ -469,8 +486,17 @@ print(f"Merged {features_df.count():,} rows for feature_ts = {as_of_ts}")
 # MAGIC             table_name="mlops_data_science.features.first_order_propensity_user_features",
 # MAGIC             lookup_key="internal_user_id",     # entity key
 # MAGIC             timestamp_lookup_key="feature_ts", # as-of join -> no leakage from the future
-# MAGIC             feature_names=None,                # None = all; pass a list to pick THIS model's subset
-# MAGIC         )
+# MAGIC             # This explicit list is exactly where each model plugs in its OWN selected
+# MAGIC             # subset from the feature-selection step (do NOT pass None = every feature).
+# MAGIC             # These are real raw columns produced by this notebook:
+# MAGIC             feature_names=[
+# MAGIC                 "t_30_txn",                       # card-txn count, last 30d
+# MAGIC                 "coins_bal_overall",              # coin balance
+# MAGIC                 "flight_searches_30d",            # flight-search count, last 30d
+# MAGIC                 "days_since_last_flight_search",  # flight-search recency (days)
+# MAGIC                 "app_opens_30d",                  # app-engagement count, last 30d
+# MAGIC                 "lounge_used",                    # lounge-ever-used flag
+# MAGIC             ],
 # MAGIC     ],
 # MAGIC     label="output",
 # MAGIC     exclude_columns=["feature_ts"],            # keep the join key out of the model matrix
