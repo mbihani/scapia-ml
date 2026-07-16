@@ -577,7 +577,9 @@ def model_based_selection(pdf_in, features, y_arr, n_splits, top_k, random_state
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
     gains = {f: [] for f in features}
     shaps = {f: [] for f in features}
-    topk_counts = {f: 0 for f in features}
+    gain_topk_counts = {f: 0 for f in features}   # per-fold appearances in the top-K by GAIN
+    shap_topk_counts = {f: 0 for f in features}   # per-fold appearances in the top-K by mean |SHAP|
+    shap_folds = 0                                # folds in which SHAP was actually computed
     for tr, va in skf.split(X, y_arr):
         model = xgb.XGBClassifier(
             objective="binary:logistic", eval_metric="aucpr", tree_method="hist",
@@ -585,34 +587,78 @@ def model_based_selection(pdf_in, features, y_arr, n_splits, top_k, random_state
             random_state=random_state, n_jobs=-1,
         )
         model.fit(X.iloc[tr], y_arr[tr])
+        # --- gain stability ---
         raw_gain = model.get_booster().get_score(importance_type="gain")
         fold_gain = _agg_importance({col: raw_gain.get(col, 0.0) for col in X.columns}, origin)
         for f in features:
             gains[f].append(fold_gain.get(f, 0.0))
         for f in sorted(features, key=lambda z: fold_gain.get(z, 0.0), reverse=True)[:top_k]:
-            topk_counts[f] += 1
+            gain_topk_counts[f] += 1
+        # --- SHAP stability (computed IN PARALLEL to gain, on the held-out fold) ---
         sample = X.iloc[va]
         if len(sample) > 5000:
             sample = sample.sample(5000, random_state=random_state)
         fold_shap = _shap_importance(model, sample, origin)
         if fold_shap is not None:
+            shap_folds += 1
             for f in features:
                 shaps[f].append(fold_shap.get(f, 0.0))
+            for f in sorted(features, key=lambda z: fold_shap.get(z, 0.0), reverse=True)[:top_k]:
+                shap_topk_counts[f] += 1
     imp_df = pd.DataFrame({
         "feature": features,
         "mean_gain": [round(float(np.mean(gains[f])), 4) if gains[f] else 0.0 for f in features],
+        "gain_topk_folds": [gain_topk_counts[f] for f in features],
         "mean_abs_shap": [round(float(np.mean(shaps[f])), 6) if shaps[f] else np.nan for f in features],
-        "topk_folds": [topk_counts[f] for f in features],
-    }).sort_values(["topk_folds", "mean_gain"], ascending=False).reset_index(drop=True)
-    majority = (n_splits // 2) + 1
-    selected = imp_df[(imp_df["topk_folds"] >= majority) & (imp_df["mean_gain"] > 0)]["feature"].tolist()
-    return imp_df, selected, majority
+        "shap_topk_folds": [shap_topk_counts[f] for f in features],
+    })
+    # A feature is "stable" under a metric if it lands in that metric's top-K in a MAJORITY of folds.
+    majority_gain = (n_splits // 2) + 1
+    gain_stable = {
+        f: (gain_topk_counts[f] >= majority_gain) and bool(gains[f] and np.mean(gains[f]) > 0)
+        for f in features
+    }
+    if shap_folds > 0:
+        majority_shap = (shap_folds // 2) + 1
+        shap_stable = {
+            f: (shap_topk_counts[f] >= majority_shap) and bool(shaps[f] and np.mean(shaps[f]) > 0)
+            for f in features
+        }
+        # COMBINED RULE = INTERSECTION of gain-stability AND SHAP-stability.
+        # WHY intersection (not union / rank-average): gain measures how much a feature improves the tree
+        # SPLITS; SHAP measures its marginal contribution to individual PREDICTIONS. These are independent
+        # views, so requiring a feature to be stable under BOTH keeps only the ones the two signals AGREE
+        # on across folds — the conservative choice that guards against metric-specific artifacts (a
+        # feature XGBoost splits on often but that barely moves predictions, or vice-versa). This is the
+        # mechanism by which SHAP actually DRIVES final_selected, not just decorates the report.
+        rule = "gain_and_shap_intersection"
+        selected = [f for f in features if gain_stable[f] and shap_stable[f]]
+    else:
+        # SHAP unavailable on this runtime -> documented fallback to gain-only stability.
+        majority_shap = None
+        shap_stable = {f: False for f in features}
+        rule = "gain_only_fallback_shap_unavailable"
+        selected = [f for f in features if gain_stable[f]]
+    imp_df["gain_stable"] = [bool(gain_stable[f]) for f in features]
+    imp_df["shap_stable"] = [bool(shap_stable[f]) for f in features]
+    imp_df["selected"] = [f in set(selected) for f in features]
+    imp_df = imp_df.sort_values(
+        ["selected", "shap_topk_folds", "gain_topk_folds", "mean_gain"], ascending=False
+    ).reset_index(drop=True)
+    return imp_df, selected, majority_gain, majority_shap, shap_folds, rule
 
 
-model_imp_df, model_selected, _majority = model_based_selection(
+model_imp_df, model_selected, _maj_gain, _maj_shap, _shap_folds, _sel_rule = model_based_selection(
     pdf, kept_redundancy, y, CV_SPLITS, MODEL_TOPK, RANDOM_STATE
 )
-print(f"Stage 4 MODEL-BASED: stable in >= {_majority}/{CV_SPLITS} folds -> {len(model_selected)} features")
+_shap_desc = (
+    f"AND shap-stable >= {_maj_shap}/{_shap_folds} folds"
+    if _shap_folds else "(SHAP unavailable this run -> gain-only fallback)"
+)
+print(
+    f"Stage 4 MODEL-BASED [{_sel_rule}]: gain-stable >= {_maj_gain}/{CV_SPLITS} folds {_shap_desc} "
+    f"-> {len(model_selected)} selected"
+)
 print(model_imp_df.to_string(index=False))
 
 # COMMAND ----------
@@ -686,6 +732,11 @@ with mlflow.start_run(run_name="fop_feature_selection") as run:
         "model_topk": MODEL_TOPK,
         "leakage_auc_thresh": LEAKAGE_AUC_THRESH,
         "n_selected": len(final_selected),
+        # Model-based (Stage 4): the combined gain+SHAP rule that produced final_selected.
+        "selection_rule": _sel_rule,
+        "majority_gain_folds": _maj_gain,
+        "majority_shap_folds": str(_maj_shap),  # None in the SHAP-unavailable fallback
+        "shap_folds": _shap_folds,
     })
     mlflow.log_metrics({
         "n_rows": float(len(pdf)),
@@ -694,6 +745,9 @@ with mlflow.start_run(run_name="fop_feature_selection") as run:
         "n_after_redundancy": float(len(kept_redundancy)),
         "n_selected": float(len(final_selected)),
         "n_leakage_flagged": float(len(flagged)),
+        # SHAP demonstrably participates: count of features stable under each metric across folds.
+        "n_gain_stable": float(int(model_imp_df["gain_stable"].sum())),
+        "n_shap_stable": float(int(model_imp_df["shap_stable"].sum())),
     })
 
     _artifact_dir = tempfile.mkdtemp()
@@ -709,9 +763,12 @@ with mlflow.start_run(run_name="fop_feature_selection") as run:
 
     _selection_json = {
         "as_of_date": cutoff_ts,
+        "selection_rule": _sel_rule,  # combined gain+SHAP rule behind final_selected (Stage 4)
         "final_selected": final_selected,
         "final_store_features": final_store_features,
         "final_non_store_features": final_non_store,  # e.g. ['segment'] — current-state, finding #1
+        "gain_stable_features": model_imp_df[model_imp_df["gain_stable"]]["feature"].tolist(),
+        "shap_stable_features": model_imp_df[model_imp_df["shap_stable"]]["feature"].tolist(),
         "dropped_screen": screen_df[screen_df["dropped"]]["feature"].tolist(),
         "dropped_redundancy": dropped_corr,
         "leakage_flagged": flagged,
@@ -763,7 +820,7 @@ if final_non_store:
     )
 
 # A downstream model pipeline would rebuild the training set from the SELECTED subset like so:
-#   selected_training_set = fe.create_training_set(
-#       df=spine_df, feature_lookups=model_feature_lookups, label=LABEL, exclude_columns=[FEATURE_TS],
-#   )
-#   selected_training_df = selected_training_set.load_df()   # then encode + train DOWNSTREAM (out of scope here)
+# selected_training_set = fe.create_training_set(
+#     df=spine_df, feature_lookups=model_feature_lookups, label=LABEL, exclude_columns=[FEATURE_TS],
+# )
+# selected_training_df = selected_training_set.load_df()   # then encode + train DOWNSTREAM (out of scope here)
