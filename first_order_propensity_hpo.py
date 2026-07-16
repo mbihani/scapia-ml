@@ -13,9 +13,12 @@
 # MAGIC deliberately-distributed HPO path (per the explicit build request).
 # MAGIC
 # MAGIC ## What this notebook does
-# MAGIC 1. **Training set** — rebuilds the spine (label + eligibility) and the point-in-time `create_training_set`
-# MAGIC    join on the **selected** store features, plus the `segment` current-state join (finding-#1 leakage
-# MAGIC    caveat preserved). SQL/Spark only — no connector, no PAT, no egress.
+# MAGIC 1. **Training set** — LOADS the selected feature list from the upstream feature-selection MLflow run
+# MAGIC    (`selected_features.json` -> `final_store_features` + `final_non_store_features`), rebuilds the spine
+# MAGIC    (label + eligibility) and the point-in-time `create_training_set` join on those selected store
+# MAGIC    features, and joins `segment` current-state ONLY if selection retained it (finding-#1 leakage caveat
+# MAGIC    preserved). Feature selection is NOT re-run and NOT guessed here. SQL/Spark only — no connector,
+# MAGIC    no PAT, no egress.
 # MAGIC 2. **Split** — stratified train / val / test. HPO uses train + val only; **test is held out and touched
 # MAGIC    exactly once** at the end.
 # MAGIC 3. **HPO** — distributed Optuna over the v7 XGBoost search space, early stopping (so `n_estimators` is
@@ -127,18 +130,14 @@ QUALIFYING_PRODUCT_CATEGORIES = [
     "ECOMMERCE", "EXPERIENCE", "VISA", "HOLIDAY",
 ]
 
-# --- SELECTED feature subset (do NOT re-run feature selection here) ---------
-# Defaults to the 6 store-resident features the spine/feature-store notebooks demonstrate as the selected
-# subset (final_store_features), plus the `segment` current-state join. Every name is a REAL column
-# produced by first_order_propensity_user_features.py. Overridable via the widget in the next cell.
-DEFAULT_SELECTED_STORE_FEATURES = [
-    "t_30_txn",                       # card-txn count, last 30d
-    "coins_bal_overall",              # coin balance
-    "flight_searches_30d",            # flight-search count, last 30d
-    "days_since_last_flight_search",  # flight-search recency (days); NULL = never (XGBoost handles NaN)
-    "app_opens_30d",                  # app-engagement count, last 30d
-    "lounge_used",                    # lounge-ever-used flag (0/1)
-]
+# --- SELECTED feature subset --------------------------------------------------
+# There is NO hardcoded/guessed feature list here. The selected subset is LOADED from the upstream
+# feature-selection MLflow run (its `selected_features.json` artifact) — see the widget cell. The optional
+# manual-candidate path is opt-in only and clearly labelled as candidates, not a selection.
+#
+# Only `segment` is supported as a non-store (current-state) feature in this pipeline. If the selection run
+# lists other non-store features, they are reported and skipped (no encoder exists for them here).
+SUPPORTED_NON_STORE_FEATURES = ["segment"]
 
 # --- Reproducibility / split -------------------------------------------------
 RANDOM_STATE = 42
@@ -158,6 +157,11 @@ MAX_BOOST_ROUNDS = 1000
 EARLY_STOPPING_ROUNDS = 50
 WATCH_METRIC = "auc"
 
+# Bump this whenever the search space (param ranges / which params are tuned) changes. It is part of the
+# study-name fingerprint (below), so a search-space change starts a FRESH study instead of resuming an
+# incompatible one.
+SEARCH_SPACE_VERSION = "v1"
+
 # Optional driver-memory down-sampling of the pandas frame (mirrors the sibling notebook). None = full set.
 SAMPLE_FRACTION = None
 
@@ -169,12 +173,22 @@ SEGMENT_TOP_CATS = 8
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 1a. Widgets — runtime parameters
+# MAGIC ## 1a. Widgets — runtime parameters + LOAD the selected feature list
 # MAGIC `as_of_date` MUST equal the as-of date the feature table was materialized for (so the PIT join finds a
 # MAGIC row). For reproducible runs always pass it explicitly; blank auto-derives the v7 reference cutoff (drifts
 # MAGIC as new orders arrive). The imbalance-strategy widget is the one-line toggle for methodology fix (a).
+# MAGIC
+# MAGIC **Feature list is consumed, not guessed.** `features_source="selection_run"` (default) LOADS
+# MAGIC `final_store_features` + `final_non_store_features` from the feature-selection run named by the required
+# MAGIC `selection_run_id` widget; `segment` is included ONLY if selection retained it. If `selection_run_id`
+# MAGIC is blank the cell **fails fast**. `features_source="manual_candidates"` is an explicit opt-in escape
+# MAGIC hatch that treats `features_override` as CANDIDATES (not a selection) and prints a loud warning.
 
 # COMMAND ----------
+
+import json
+
+import mlflow
 
 dbutils.widgets.text(
     "as_of_date",
@@ -182,13 +196,24 @@ dbutils.widgets.text(
     "Cutoff / as-of (YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS', IST). Blank = auto-derive v7 reference cutoff.",
 )
 dbutils.widgets.text(
-    "selected_store_features",
-    ",".join(DEFAULT_SELECTED_STORE_FEATURES),
-    "Comma-separated SELECTED store features (feature selection is NOT re-run here).",
+    "selection_run_id",
+    "",
+    "REQUIRED (features_source=selection_run): MLflow run_id of the feature-selection run to consume.",
+)
+dbutils.widgets.dropdown(
+    "features_source",
+    "selection_run",
+    ["selection_run", "manual_candidates"],
+    "Where the feature list comes from: the upstream selection run (default) OR a manual candidate list.",
+)
+dbutils.widgets.text(
+    "features_override",
+    "",
+    "manual_candidates ONLY: comma-separated CANDIDATE features. Ignored when features_source=selection_run.",
 )
 dbutils.widgets.dropdown(
     "include_segment", "yes", ["yes", "no"],
-    "Include `segment` (current-state join; finding-#1 leakage caveat applies).",
+    "manual_candidates ONLY: include `segment` (current-state; finding-#1 caveat). selection_run derives this.",
 )
 dbutils.widgets.text("n_trials", "64", "Number of Optuna trials.")
 dbutils.widgets.text("n_jobs", "-1", "Parallel trials across Spark executors (-1 = match number of tasks).")
@@ -205,14 +230,68 @@ dbutils.widgets.dropdown(
     "Business metric to optimize on the POPULATION-rate validation fold (fix (b)).",
 )
 
-# Read widgets into module-level names used throughout.
-SELECTED_STORE_FEATURES = [c.strip() for c in dbutils.widgets.get("selected_store_features").split(",") if c.strip()]
-INCLUDE_SEGMENT = dbutils.widgets.get("include_segment") == "yes"
+# Read the simple runtime knobs.
 N_TRIALS = int(dbutils.widgets.get("n_trials"))
 N_JOBS = int(dbutils.widgets.get("n_jobs"))
 IMBALANCE_STRATEGY = dbutils.widgets.get("imbalance_strategy")
 HPO_OBJECTIVE_METRIC = dbutils.widgets.get("hpo_objective_metric")
-STUDY_NAME = "fop_hpo_mlflow_spark_study"
+FEATURES_SOURCE = dbutils.widgets.get("features_source")
+SELECTION_RUN_ID = dbutils.widgets.get("selection_run_id").strip()
+
+
+def load_selected_features_from_run(run_id):
+    """Load the SELECTED feature list from a feature-selection run's `selected_features.json` artifact.
+
+    Returns (store_features, non_store_features) exactly as the selection notebook wrote them — no guessing.
+    """
+    local = mlflow.artifacts.download_artifacts(run_id=run_id, artifact_path="selected_features.json")
+    with open(local) as fh:
+        sel = json.load(fh)
+    store = list(sel.get("final_store_features") or [])
+    non_store = list(sel.get("final_non_store_features") or [])
+    if not store and not non_store:
+        raise ValueError(
+            f"selected_features.json in run {run_id} has empty final_store_features AND "
+            f"final_non_store_features — nothing selected to train on."
+        )
+    return store, non_store
+
+
+if FEATURES_SOURCE == "selection_run":
+    if not SELECTION_RUN_ID:
+        raise ValueError(
+            "features_source='selection_run' but `selection_run_id` widget is empty. Set it to the MLflow "
+            "run_id of the feature-selection run (the one that logged selected_features.json). Refusing to "
+            "guess a feature subset — FAILING FAST."
+        )
+    SELECTED_STORE_FEATURES, _final_non_store = load_selected_features_from_run(SELECTION_RUN_ID)
+    # Only `segment` is supported as a non-store (current-state) feature in this pipeline.
+    _unsupported_non_store = [f for f in _final_non_store if f not in SUPPORTED_NON_STORE_FEATURES]
+    if _unsupported_non_store:
+        print(f"WARNING: selection listed non-store features with no encoder here -> SKIPPED: {_unsupported_non_store}")
+    INCLUDE_SEGMENT = "segment" in _final_non_store
+    print(f"Loaded SELECTED features from run {SELECTION_RUN_ID}:")
+    print(f"  final_store_features    : {SELECTED_STORE_FEATURES}")
+    print(f"  final_non_store_features: {_final_non_store}  -> include_segment={INCLUDE_SEGMENT}")
+else:
+    # Opt-in escape hatch — these are CANDIDATES, not a selection.
+    SELECTED_STORE_FEATURES = [c.strip() for c in dbutils.widgets.get("features_override").split(",") if c.strip()]
+    if not SELECTED_STORE_FEATURES:
+        raise ValueError(
+            "features_source='manual_candidates' but `features_override` is empty. Provide a comma-separated "
+            "candidate list, or switch features_source back to 'selection_run'. FAILING FAST."
+        )
+    INCLUDE_SEGMENT = dbutils.widgets.get("include_segment") == "yes"
+    print("=" * 88)
+    print("!!! WARNING: THESE ARE CANDIDATES, NOT A SELECTION !!!")
+    print("!!! features_source='manual_candidates' — the feature list below was typed by hand and has NOT")
+    print("!!! been through the feature-selection / leakage-guard pipeline. Use ONLY for illustration.")
+    print("=" * 88)
+    print(f"  candidate store features: {SELECTED_STORE_FEATURES}")
+    print(f"  include_segment         : {INCLUDE_SEGMENT}")
+
+if not SELECTED_STORE_FEATURES and not INCLUDE_SEGMENT:
+    raise ValueError("Resolved feature set is empty (no store features and segment not included). FAILING FAST.")
 
 # `segment` is the one selected feature with no as-of source (finding #1) — joined current-state below.
 CATEGORICAL_FEATURES = ["segment"] if INCLUDE_SEGMENT else []
@@ -417,8 +496,10 @@ print(f"Feature set for HPO        : {SELECTED_STORE_FEATURES + CATEGORICAL_FEAT
 # MAGIC one-hot-encoded — mirroring the sibling notebook's `_build_model_matrix`. v7's bucketing/one-hot of the
 # MAGIC numerics is a separate downstream-encoding concern and is intentionally NOT reproduced here.
 # MAGIC
-# MAGIC The `segment` one-hot vocabulary is fixed on the FULL frame **before** the split (a structural,
-# MAGIC label-independent choice) so train / val / test share identical feature columns — no column skew.
+# MAGIC Rows are split FIRST. The `segment` one-hot vocabulary is learned from the **TRAIN split only** and
+# MAGIC applied unchanged to val/test (unseen categories fold into an explicit `Other` bucket), so there is no
+# MAGIC train/test leakage and all splits share identical feature columns. No test label statistic is computed
+# MAGIC here — the held-out test labels are untouched until the single final evaluation.
 
 # COMMAND ----------
 
@@ -426,6 +507,7 @@ import re
 
 import numpy as np
 import pandas as pd
+from sklearn.model_selection import train_test_split
 
 if SAMPLE_FRACTION:
     _sdf = analysis_df.sample(fraction=SAMPLE_FRACTION, seed=RANDOM_STATE)
@@ -435,49 +517,73 @@ else:
 
 pdf = _sdf.toPandas()
 
+_numeric_present = [c for c in SELECTED_STORE_FEATURES if c in pdf.columns]
+_categorical_present = [c for c in CATEGORICAL_FEATURES if c in pdf.columns]
+y_all = pdf[LABEL].astype(int)
 
-def build_model_matrix(pdf_in, numeric_features, categorical_features, top_cats):
-    """Raw numeric (NaN kept — XGBoost handles missing natively) + one-hot top-K categories.
 
-    Mirrors first_order_propensity_spine_and_selection.py::_build_model_matrix. Vocabulary is derived from
-    `pdf_in` as a whole so the columns are stable across the later train/val/test split.
+def fit_segment_vocab(pdf_train, categorical_features, top_cats):
+    """Learn the one-hot vocabulary from the TRAIN split ONLY. 'Other' is the catch-all for unseen/rare cats.
+
+    Returns {feature: [categories..., 'Other']} — a FIXED category set applied unchanged to val/test.
+    """
+    vocab = {}
+    for c in categorical_features:
+        vals = pdf_train[c].astype("object").fillna("No Segment")
+        cats = list(vals.value_counts().head(top_cats).index)
+        if "Other" not in cats:
+            cats.append("Other")
+        vocab[c] = cats
+    return vocab
+
+
+def build_model_matrix(pdf_part, numeric_features, categorical_features, vocab):
+    """Raw numeric (NaN kept — XGBoost handles missing natively) + one-hot using a FIXED train-fit vocab.
+
+    Mirrors first_order_propensity_spine_and_selection.py::_build_model_matrix, but the category vocabulary
+    is passed in (fit on TRAIN) rather than re-derived, so train/val/test get identical columns with no leak.
     """
     parts = []
     for c in numeric_features:
-        parts.append(pdf_in[c].astype("float32").rename(c))
+        parts.append(pdf_part[c].astype("float32").rename(c))
     for c in categorical_features:
-        vals = pdf_in[c].astype("object").fillna("No Segment")
-        keep_cats = vals.value_counts().head(top_cats).index
-        vals = vals.where(vals.isin(keep_cats), "Other")
+        cats = vocab[c]
+        vals = pdf_part[c].astype("object").fillna("No Segment")
+        vals = vals.where(vals.isin(cats), "Other")             # unseen/rare -> explicit Other bucket
+        vals = pd.Categorical(vals, categories=cats)            # FIXED categories -> stable, complete columns
         dummies = pd.get_dummies(vals, prefix=c, dtype="float32")
         dummies.columns = [re.sub(r"[^0-9a-zA-Z_]", "_", str(dc)) for dc in dummies.columns]
+        dummies.index = pdf_part.index
         parts.append(dummies)
     return pd.concat(parts, axis=1)
 
 
-_numeric_present = [c for c in SELECTED_STORE_FEATURES if c in pdf.columns]
-_categorical_present = [c for c in CATEGORICAL_FEATURES if c in pdf.columns]
-
-X = build_model_matrix(pdf, _numeric_present, _categorical_present, SEGMENT_TOP_CATS)
-y = pdf[LABEL].astype(int)
-FEATURE_NAMES = list(X.columns)
-
-print(f"Model matrix: {X.shape[0]:,} rows x {X.shape[1]} columns")
-print(f"Population base rate: {y.mean():.3%}")
-print(f"Feature columns: {FEATURE_NAMES}")
-
 # COMMAND ----------
 
-# --- Stratified train / val / test; test held out and touched ONCE at the end ---------------
-from sklearn.model_selection import train_test_split
+# --- SPLIT ROWS FIRST, then fit the vocab on TRAIN only. Test labels stay untouched until final eval. -------
+# Split on row indices so the vocab is never exposed to val/test rows.
+_idx = pdf.index.to_numpy()
+_idx_trv, _idx_test = train_test_split(
+    _idx, test_size=TEST_FRACTION, random_state=RANDOM_STATE, stratify=y_all.to_numpy(),
+)
+_idx_tr_raw, _idx_val = train_test_split(
+    _idx_trv, test_size=VAL_FRACTION, random_state=RANDOM_STATE, stratify=y_all.loc[_idx_trv].to_numpy(),
+)
 
-X_trv, X_test, y_trv, y_test = train_test_split(
-    X, y, test_size=TEST_FRACTION, random_state=RANDOM_STATE, stratify=y,
-)
-# X_tr_raw holds the full-population HPO training pool (pre-undersampling); X_val holds the population fold.
-X_tr_raw, X_val, y_tr_raw, y_val = train_test_split(
-    X_trv, y_trv, test_size=VAL_FRACTION, random_state=RANDOM_STATE, stratify=y_trv,
-)
+# Vocabulary learned from the TRAIN split ONLY (no full-data fit -> no train/test leakage).
+_vocab = fit_segment_vocab(pdf.loc[_idx_tr_raw], _categorical_present, SEGMENT_TOP_CATS)
+
+X_tr_raw = build_model_matrix(pdf.loc[_idx_tr_raw], _numeric_present, _categorical_present, _vocab)
+X_val = build_model_matrix(pdf.loc[_idx_val], _numeric_present, _categorical_present, _vocab)
+X_test = build_model_matrix(pdf.loc[_idx_test], _numeric_present, _categorical_present, _vocab)
+FEATURE_NAMES = list(X_tr_raw.columns)
+# Defensive: identical columns across splits (the FIXED vocab already guarantees this).
+X_val = X_val.reindex(columns=FEATURE_NAMES, fill_value=0.0)
+X_test = X_test.reindex(columns=FEATURE_NAMES, fill_value=0.0)
+
+y_tr_raw = y_all.loc[_idx_tr_raw]
+y_val = y_all.loc[_idx_val]
+y_test = y_all.loc[_idx_test]  # NOT inspected until the single final evaluation
 
 
 def undersample_majority(X_in, y_in, neg_per_pos, seed):
@@ -510,7 +616,8 @@ SPW_RATIO = float((y_tr == 0).sum() / max(int((y_tr == 1).sum()), 1))
 
 print(f"TRAIN: {X_tr.shape[0]:,} rows (rate {y_tr.mean():.3%})   [neg/pos ratio {SPW_RATIO:.1f}]")
 print(f"VAL  : {X_val.shape[0]:,} rows (rate {y_val.mean():.3%})   [population prior — fix (b)]")
-print(f"TEST : {X_test.shape[0]:,} rows (rate {y_test.mean():.3%})   [held out; touched ONCE at the end]")
+# TEST label rate deliberately NOT printed here (no peeking) — only its size; labels stay sealed until eval.
+print(f"TEST : {X_test.shape[0]:,} rows   [held out; labels untouched until the single final evaluation]")
 
 # Broadcast the compact arrays so each distributed trial reads the same data on its executor.
 _HPO_DATA = spark.sparkContext.broadcast({
@@ -568,6 +675,25 @@ def _max_f2(y_true, proba):
     return float(best)
 
 
+def best_f2_threshold(y_true, proba):
+    """Threshold that maximizes F2 on the GIVEN fold. Call this on VALIDATION, then apply once to test
+    (audit Tier 1 #3: never choose the threshold on the held-out test set). Returns (threshold, f2_at_thr)."""
+    import numpy as np
+    from sklearn.metrics import fbeta_score
+
+    y_true = np.asarray(y_true)
+    proba = np.asarray(proba)
+    best_t, best_f2 = 0.5, -1.0
+    for t in np.linspace(0.05, 0.95, 91):
+        yp = (proba >= t).astype(int)
+        if yp.sum() == 0:
+            continue
+        f2 = fbeta_score(y_true, yp, beta=2, zero_division=0)
+        if f2 > best_f2:
+            best_f2, best_t = f2, float(t)
+    return best_t, float(best_f2)
+
+
 def business_metric(y_true, proba, name):
     """Higher-is-better business metric on the population-rate fold. One of the fix-(b) choices."""
     from sklearn.metrics import roc_auc_score
@@ -584,7 +710,7 @@ class OptunaXGBPruningCallback(xgb.callback.TrainingCallback):
 
     Standard Optuna pruning pattern (mirrors optuna.integration.XGBoostPruningCallback). Because the study
     MINIMIZES, we report the NEGATED watch metric so a low ROC-AUC trajectory reads as "worse" (above the
-    running median) and gets pruned. See the TODO(verify-api) note in the run cell.
+    running median) and gets pruned. Pruning support is confirmed in the MLflow source; see the run cell.
     """
 
     def __init__(self, trial, eval_set_name, metric_name):
@@ -676,6 +802,12 @@ print("Search space: max_depth, min_child_weight, learning_rate, subsample, cols
 # MAGIC experiment; `MlflowSparkStudy.optimize` fans trials out across executors (`n_jobs=-1` matches the
 # MAGIC number of Spark tasks). `MedianPruner` and `TPESampler` are the documented defaults; passed explicitly
 # MAGIC here (with a seed) for reproducibility.
+# MAGIC
+# MAGIC **Study name = config fingerprint.** `study_name` is a short hash of the immutable config that defines
+# MAGIC trial comparability: cutoff / as-of date, the sorted selected feature list, whether `segment` is
+# MAGIC included, the HPO objective metric, the imbalance strategy, and the search-space version. A study
+# MAGIC resumes (re-uses prior trials) ONLY when that fingerprint matches; ANY change starts a FRESH study, so
+# MAGIC a trial from an incompatible config can never become champion for this one.
 
 # COMMAND ----------
 
@@ -684,14 +816,13 @@ print("Search space: max_depth, min_child_weight, learning_rate, subsample, cols
 #   https://learn.microsoft.com/en-us/azure/databricks/machine-learning/automl-hyperparam-tuning/optuna
 #   https://github.com/mlflow/mlflow/blob/master/mlflow/pyspark/optuna/study.py  (signatures + default direction)
 #
-# TODO(verify-api): The official docs show the MlflowSparkStudy/MlflowStorage constructors, optimize(), and
-#   confirm MedianPruner as the default pruner — but they do NOT show an intermediate-value example
-#   (trial.report / trial.should_prune) against MlflowStorage. This notebook uses the STANDARD Optuna pruning
-#   API (mirroring optuna.integration.XGBoostPruningCallback) and assumes MlflowStorage persists intermediate
-#   values across executors so MedianPruner can act. VALIDATE LIVE on the target cluster that: (1) trials are
-#   marked PRUNED as expected, and (2) raising optuna.TrialPruned() from inside an xgboost callback propagates
-#   cleanly under MlflowSparkStudy. If pruning misbehaves, fall back to reporting once per fixed round-block or
-#   drop the callback (early stopping alone still bounds each trial).
+# Pruning support is CONFIRMED in the MLflow source: MlflowStorage.set_trial_intermediate_value() exists
+#   (so trial.report persists per-round values) and MlflowSparkStudy handles optuna.TrialPruned. MedianPruner
+#   is the documented default. Pruning is a MANDATORY part of this HPO contract — there is no path that
+#   silently disables it.
+# TODO(verify-live): the docs show no end-to-end intermediate-value example, so confirm on the target cluster
+#   that trials actually reach state PRUNED (e.g. inspect trial states after the run). If a runtime ever shows
+#   pruning is NOT taking effect, FAIL FAST and fix the reporting path — do NOT disable pruning to proceed.
 import mlflow
 import optuna
 from mlflow.optuna.storage import MlflowStorage
@@ -706,6 +837,23 @@ experiment_id = mlflow.get_experiment_by_name(
 ).experiment_id
 
 mlflow_storage = MlflowStorage(experiment_id=experiment_id)
+
+# Study name from an IMMUTABLE config fingerprint (see the markdown above). Resume ONLY on an exact match;
+# any change to these inputs -> a new study, so incompatible trials never mix.
+import hashlib
+
+_fp_payload = "|".join([
+    f"cutoff={cutoff_ts}",
+    "features=" + ",".join(sorted(SELECTED_STORE_FEATURES)),
+    f"segment={INCLUDE_SEGMENT}",
+    f"objective={HPO_OBJECTIVE_METRIC}",
+    f"imbalance={IMBALANCE_STRATEGY}",
+    f"space={SEARCH_SPACE_VERSION}",
+])
+_fp = hashlib.sha1(_fp_payload.encode("utf-8")).hexdigest()[:12]
+STUDY_NAME = f"fop_hpo_{_fp}"
+print(f"Study fingerprint payload: {_fp_payload}")
+print(f"Study name               : {STUDY_NAME}")
 
 mlflow_study = MlflowSparkStudy(
     study_name=STUDY_NAME,
@@ -722,18 +870,11 @@ print("Study complete.")
 # COMMAND ----------
 
 # --- Retrieve best params/value (study MINIMIZES -> flip the sign back to the business metric) -----------
-# TODO(verify-api): the official example writes `best_params = study.best_params` with an undefined `study`
-#   (doc typo). The intended accessor is `.best_params` on the study object; MlflowSparkStudy also exposes
-#   get_resume_info() (best_params/best_value) per the source. Try the direct property, fall back to resume info.
-try:
-    best_params = dict(mlflow_study.best_params)
-    best_value_min = float(mlflow_study.best_value)
-except Exception as exc:  # noqa: BLE001 — defensive: accessor shape not confirmed in the public docs
-    print(f"Direct .best_params/.best_value unavailable ({exc}); using get_resume_info().")
-    _info = mlflow_study.get_resume_info()
-    best_params = dict(_info.best_params)
-    best_value_min = float(_info.best_value)
-
+# `best_params` / `best_value` are inherited from optuna's Study and are supported here (the docs' example
+# `study.best_params` just had a typo'd variable name). Use them directly — NOT get_resume_info(), which
+# only holds results for RESUMED studies and would be unsound as a general accessor.
+best_params = dict(mlflow_study.best_params)
+best_value_min = float(mlflow_study.best_value)
 best_business_metric = -best_value_min  # undo the minimization negation
 
 print(f"Best {HPO_OBJECTIVE_METRIC} (val, population rate): {best_business_metric:.4f}")
@@ -748,14 +889,16 @@ for _k, _v in best_params.items():
 # MAGIC Refit XGBoost on the best params, then score the **held-out test at the true population base rate**.
 # MAGIC The effective number of rounds is re-derived deterministically via early stopping on TRAIN→VAL (same
 # MAGIC data/seed as the winning trial), then the champion is fit on TRAIN+VAL for that many rounds. Report
-# MAGIC ROC-AUC, top-decile lift and F2; log best params + test metrics to MLflow.
+# MAGIC ROC-AUC and top-decile lift (both threshold-free). The **F2 threshold is chosen on VALIDATION** and
+# MAGIC applied ONCE to test (audit Tier 1 #3 — never pick the threshold on the held-out set). Log best params,
+# MAGIC the chosen threshold, and test metrics to MLflow.
 
 # COMMAND ----------
 
 import numpy as np
 import pandas as pd
 import xgboost as xgb
-from sklearn.metrics import average_precision_score, roc_auc_score
+from sklearn.metrics import average_precision_score, fbeta_score, roc_auc_score
 
 # Base params + the tuned params. scale_pos_weight per the imbalance strategy (fix (a)).
 champ_params = {
@@ -778,6 +921,12 @@ _probe = xgb.train(
 best_num_round = int(getattr(_probe, "best_iteration", MAX_BOOST_ROUNDS - 1)) + 1
 print(f"Champion rounds (from early stopping on train->val): {best_num_round}")
 
+# F2 operating threshold is chosen on the VALIDATION fold (never on test — audit Tier 1 #3), using the
+# probe model's validation predictions. This FIXED threshold is applied once to test below.
+_val_proba_probe = _probe.predict(_dvl, iteration_range=(0, best_num_round))
+f2_threshold, val_f2_at_threshold = best_f2_threshold(y_val.to_numpy(), _val_proba_probe)
+print(f"F2 threshold chosen on VAL: {f2_threshold:.3f} (val F2 = {val_f2_at_threshold:.4f})")
+
 # 2) Final champion on TRAIN+VAL, using the same imbalance strategy so the training prior is consistent.
 X_fit = pd.concat([X_tr_raw, X_val], axis=0)
 y_fit = pd.concat([y_tr_raw, y_val], axis=0)
@@ -795,18 +944,19 @@ _dtest = xgb.DMatrix(X_test.to_numpy(dtype="float32"), feature_names=FEATURE_NAM
 test_proba = champion.predict(_dtest)
 _y_test = y_test.to_numpy()
 
-test_roc_auc = float(roc_auc_score(_y_test, test_proba))
-test_pr_auc = float(average_precision_score(_y_test, test_proba))
-test_top_decile_lift = _top_decile_lift(_y_test, test_proba)
-test_f2_max = _max_f2(_y_test, test_proba)
-test_base_rate = float(_y_test.mean())
+test_roc_auc = float(roc_auc_score(_y_test, test_proba))                 # threshold-free
+test_pr_auc = float(average_precision_score(_y_test, test_proba))        # threshold-free
+test_top_decile_lift = _top_decile_lift(_y_test, test_proba)             # threshold-free
+# F2 at the VAL-chosen threshold, applied ONCE to test (no sweep on test labels).
+test_f2_at_val_thr = float(fbeta_score(_y_test, (test_proba >= f2_threshold).astype(int), beta=2, zero_division=0))
+test_base_rate = float(_y_test.mean())  # computed here, at the single final eval (not before)
 
 print("=== Honest TEST metrics (population base rate) ===")
-print(f"Base rate        : {test_base_rate:.3%}  ({int(_y_test.sum()):,} positives / {len(_y_test):,})")
-print(f"ROC-AUC          : {test_roc_auc:.4f}")
-print(f"PR-AUC           : {test_pr_auc:.4f}")
-print(f"Top-decile lift  : {test_top_decile_lift:.3f}x")
-print(f"F2 (max, swept)  : {test_f2_max:.4f}")
+print(f"Base rate            : {test_base_rate:.3%}  ({int(_y_test.sum()):,} positives / {len(_y_test):,})")
+print(f"ROC-AUC              : {test_roc_auc:.4f}")
+print(f"PR-AUC               : {test_pr_auc:.4f}")
+print(f"Top-decile lift      : {test_top_decile_lift:.3f}x")
+print(f"F2 @ val threshold   : {test_f2_at_val_thr:.4f}  (threshold {f2_threshold:.3f} chosen on VAL)")
 
 # Decile lift table (v7-style: Decile 1 = top 10%).
 _eval = pd.DataFrame({"actual": _y_test, "proba": test_proba})
@@ -846,11 +996,13 @@ with mlflow.start_run(run_name="fop_hpo_champion") as run:
     })
     mlflow.log_metrics({
         f"best_val_{HPO_OBJECTIVE_METRIC}": best_business_metric,
+        "val_f2_threshold": f2_threshold,          # chosen on VAL, applied once to test
+        "val_f2_at_threshold": val_f2_at_threshold,
         "test_base_rate": test_base_rate,
         "test_roc_auc": test_roc_auc,
         "test_pr_auc": test_pr_auc,
         "test_top_decile_lift": test_top_decile_lift,
-        "test_f2_max": test_f2_max,
+        "test_f2_at_val_threshold": test_f2_at_val_thr,
     })
     print(f"Logged champion run: {run.info.run_id}")
 
@@ -865,8 +1017,9 @@ with mlflow.start_run(run_name="fop_hpo_champion") as run:
 # MAGIC   (with the selected `FeatureLookup` so scoring is point-in-time correct).
 # MAGIC * **Probability calibration** — undersampling (default strategy) distorts absolute probabilities;
 # MAGIC   calibrate (e.g. Platt / isotonic on a population-rate fold) before any threshold-based decisioning.
-# MAGIC * **Operating-threshold selection** — pick the deployment threshold on a population-rate fold for the
-# MAGIC   business objective (v7 shipped at 0.45); this notebook optimizes threshold-independent ranking.
+# MAGIC * **Operating-threshold selection** — this notebook derives an F2 threshold on the population-rate VAL
+# MAGIC   fold (for the reported test F2) and otherwise optimizes threshold-free ranking; a full cost-based
+# MAGIC   deployment threshold (v7 shipped at 0.45) still belongs downstream.
 # MAGIC * **Model serving** — batch scoring job or real-time endpoint.
 # MAGIC * **Feature-table materialization** — scheduled refresh of the shared feature table for new as-of dates.
 # MAGIC * **`segment` finding-#1 remediation** — replace the current-state join with an effective-dated /
