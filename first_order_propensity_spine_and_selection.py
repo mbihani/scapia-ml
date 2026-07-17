@@ -353,7 +353,8 @@ print(f"Feature set for selection  : {STORE_FEATURE_CANDIDATES + ['segment']}")
 # MAGIC 3. **Relevance** — univariate mutual information vs the label.
 # MAGIC 4. **Model-based** — XGBoost gain + SHAP importance, kept stable across CV folds.
 # MAGIC 5. **Leakage guard** — audit any feature with a suspiciously high SOLO AUC (explicitly re-audit `segment`).
-# MAGIC 6. **Log** — final selected list + all diagnostics to MLflow, inside one `mlflow.start_run()`.
+# MAGIC 6. **Log** — to MLflow (one `mlflow.start_run()`): the final selected list, the per-stage
+# MAGIC    diagnostics, the cross-fold aggregate importances, and the per-fold gain/SHAP importances behind them.
 # MAGIC
 # MAGIC Imputation / one-hot below is **selector-only** (MI, correlation and tree/SHAP models need finite
 # MAGIC numerics); it is never persisted and is not the production encoding, which lives in the model pipeline.
@@ -580,7 +581,8 @@ def model_based_selection(pdf_in, features, y_arr, n_splits, top_k, random_state
     gain_topk_counts = {f: 0 for f in features}   # per-fold appearances in the top-K by GAIN
     shap_topk_counts = {f: 0 for f in features}   # per-fold appearances in the top-K by mean |SHAP|
     shap_folds = 0                                # folds in which SHAP was actually computed
-    for tr, va in skf.split(X, y_arr):
+    per_fold_rows = []                            # long-form (tidy) per-(fold, feature) importances
+    for fold_index, (tr, va) in enumerate(skf.split(X, y_arr)):
         model = xgb.XGBClassifier(
             objective="binary:logistic", eval_metric="aucpr", tree_method="hist",
             n_estimators=300, max_depth=5, learning_rate=0.05,
@@ -592,19 +594,37 @@ def model_based_selection(pdf_in, features, y_arr, n_splits, top_k, random_state
         fold_gain = _agg_importance({col: raw_gain.get(col, 0.0) for col in X.columns}, origin)
         for f in features:
             gains[f].append(fold_gain.get(f, 0.0))
-        for f in sorted(features, key=lambda z: fold_gain.get(z, 0.0), reverse=True)[:top_k]:
+        gain_topk = sorted(features, key=lambda z: fold_gain.get(z, 0.0), reverse=True)[:top_k]
+        gain_topk_set = set(gain_topk)
+        for f in gain_topk:
             gain_topk_counts[f] += 1
         # --- SHAP stability (computed IN PARALLEL to gain, on the held-out fold) ---
         sample = X.iloc[va]
         if len(sample) > 5000:
             sample = sample.sample(5000, random_state=random_state)
         fold_shap = _shap_importance(model, sample, origin)
-        if fold_shap is not None:
+        fold_has_shap = fold_shap is not None
+        shap_topk_set = set()
+        if fold_has_shap:
             shap_folds += 1
             for f in features:
                 shaps[f].append(fold_shap.get(f, 0.0))
-            for f in sorted(features, key=lambda z: fold_shap.get(z, 0.0), reverse=True)[:top_k]:
+            shap_topk = sorted(features, key=lambda z: fold_shap.get(z, 0.0), reverse=True)[:top_k]
+            shap_topk_set = set(shap_topk)
+            for f in shap_topk:
                 shap_topk_counts[f] += 1
+        # --- per-fold long-form capture (ADDITIVE; aggregates/selection above are unchanged) ---
+        # One row per (fold, feature). On folds where SHAP was unavailable, abs_shap is NaN and
+        # in_shap_topk is False — exactly the folds excluded from the SHAP aggregates.
+        for f in features:
+            per_fold_rows.append({
+                "fold_index": fold_index,
+                "feature": f,
+                "gain": round(float(fold_gain.get(f, 0.0)), 6),
+                "abs_shap": (round(float(fold_shap.get(f, 0.0)), 6) if fold_has_shap else np.nan),
+                "in_gain_topk": bool(f in gain_topk_set),
+                "in_shap_topk": (bool(f in shap_topk_set) if fold_has_shap else False),
+            })
     imp_df = pd.DataFrame({
         "feature": features,
         "mean_gain": [round(float(np.mean(gains[f])), 4) if gains[f] else 0.0 for f in features],
@@ -645,10 +665,16 @@ def model_based_selection(pdf_in, features, y_arr, n_splits, top_k, random_state
     imp_df = imp_df.sort_values(
         ["selected", "shap_topk_folds", "gain_topk_folds", "mean_gain"], ascending=False
     ).reset_index(drop=True)
-    return imp_df, selected, majority_gain, majority_shap, shap_folds, rule
+    # Long-form (tidy) per-(fold, feature) importances — the individual values behind the aggregates
+    # above. Purely diagnostic; not consumed by the selection logic.
+    per_fold_df = pd.DataFrame(
+        per_fold_rows,
+        columns=["fold_index", "feature", "gain", "abs_shap", "in_gain_topk", "in_shap_topk"],
+    )
+    return imp_df, per_fold_df, selected, majority_gain, majority_shap, shap_folds, rule
 
 
-model_imp_df, model_selected, _maj_gain, _maj_shap, _shap_folds, _sel_rule = model_based_selection(
+model_imp_df, model_per_fold_df, model_selected, _maj_gain, _maj_shap, _shap_folds, _sel_rule = model_based_selection(
     pdf, kept_redundancy, y, CV_SPLITS, MODEL_TOPK, RANDOM_STATE
 )
 _shap_desc = (
@@ -759,6 +785,7 @@ with mlflow.start_run(run_name="fop_feature_selection") as run:
         _log_df_artifact(vif_df, "02_vif.csv", _artifact_dir)
     _log_df_artifact(mi_df, "03_mutual_info.csv", _artifact_dir)
     _log_df_artifact(model_imp_df, "04_model_importance.csv", _artifact_dir)
+    _log_df_artifact(model_per_fold_df, "04b_model_importance_per_fold.csv", _artifact_dir)
     _log_df_artifact(leak_df, "05_leakage_audit.csv", _artifact_dir)
 
     _selection_json = {
