@@ -22,7 +22,9 @@
 # MAGIC    the training matrices AND runs inside `predict`, so there is provably no data-dependent encoding at
 # MAGIC    predict time. This is the audit's train/serve-skew fix.
 # MAGIC 4. **Fit the champion XGBoost** with `best_params`, honoring the HPO imbalance strategy (undersample the
-# MAGIC    train fold + `scale_pos_weight=1` by default), early stopping on the **validation** fold.
+# MAGIC    train fold + `scale_pos_weight=1` by default), for the champion's **frozen** boosting-round count
+# MAGIC    (`champion_num_boost_round` from HPO). The final fit does **NOT** early-stop on VAL — HPO already
+# MAGIC    tuned against VAL, so re-using it here would make the downstream calibration/threshold optimistic.
 # MAGIC 5. **Optional calibration** (`CALIBRATE`, default true) — isotonic/Platt fit on the **population-rate VAL
 # MAGIC    holdout** (never the undersampled train, never test). A decile ranking is ALWAYS emitted (rank-only
 # MAGIC    consumers). Both calibrated + uncalibrated are logged. The F2 threshold is chosen on VAL and applied
@@ -60,10 +62,12 @@
 # MAGIC   UC registration path; a **signature is mandatory** for UC registration.
 # MAGIC   Ref: `https://docs.databricks.com/aws/en/mlflow/models` (Log, load, and register MLflow models).
 # MAGIC
-# MAGIC **TODO(verify-api):** `ModelInfo.registered_model_version` is NOT reliably populated across MLflow
-# MAGIC versions (open upstream feature request), so the registered version is resolved defensively:
-# MAGIC `getattr(model_info, "registered_model_version", None)` first, then a `search_model_versions` match on
-# MAGIC `run_id`. Confirm on the live cluster which path fires (both are exercised in the registration cell).
+# MAGIC **Registered-version resolution (resolved — no TODO):** `ModelInfo.registered_model_version` is not
+# MAGIC reliably populated across MLflow versions (open upstream feature request), so the registered version is
+# MAGIC resolved by an **exact `run_id` match** against `search_model_versions` — polling with bounded
+# MAGIC exponential backoff to absorb registration-index lag, and **raising** if no version matching this run
+# MAGIC appears. It never falls back to the latest version (which, under concurrent registrations, could be an
+# MAGIC unrelated model). See `_resolve_registered_version` in the registration cell.
 
 # COMMAND ----------
 
@@ -136,9 +140,11 @@ VAL_FRACTION = 0.25    # fraction of the (non-test) remainder used as the val fo
 # v7 undersamples the majority (negatives) in TRAIN to 3:1 (neg:pos). Default; overridable from the champion.
 TARGET_NEG_PER_POS = 3
 
-# --- XGBoost / early stopping (methodology: do NOT tune n_estimators) -------
-MAX_BOOST_ROUNDS = 1000
-EARLY_STOPPING_ROUNDS = 50
+# --- XGBoost (methodology: do NOT tune n_estimators; the final fit uses the HPO-frozen round count) -----
+# The final booster is trained for the champion's frozen `champion_num_boost_round` (carried over from the
+# HPO run) with NO VAL early stopping — see SECTION 5. So there is deliberately no MAX_BOOST_ROUNDS /
+# EARLY_STOPPING_ROUNDS here: consulting VAL in the final fit would double-use the calibration/threshold
+# holdout that HPO already tuned against. WATCH_METRIC is retained only as the booster's eval_metric label.
 WATCH_METRIC = "auc"
 
 # Optional driver-memory down-sampling of the pandas frame (mirrors the sibling notebooks). None = full set.
@@ -766,16 +772,36 @@ print(f"TEST : {X_test.shape[0]:,} rows   [held out; labels untouched until the 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## SECTION 5 — Fit the champion XGBoost (best_params, early stopping on VAL)
-# MAGIC The booster is fit on the (undersampled) **TRAIN** fold with `best_params`, early stopping watching the
-# MAGIC population-rate **VAL** fold — reproducing the winning trial's fit. It is fit on TRAIN **only** (not
-# MAGIC TRAIN+VAL) so VAL stays a genuine held-out fold for threshold selection AND calibration below; TEST
-# MAGIC stays sealed for the single final eval. The early-stopping round count is cross-checked against the
-# MAGIC champion's logged `champion_num_boost_round`.
+# MAGIC ## SECTION 5 — Fit the champion XGBoost (best_params, FROZEN round count — VAL is NOT consulted)
+# MAGIC The booster is fit on the (undersampled) **TRAIN** fold with `best_params` for the champion's **frozen**
+# MAGIC number of boosting rounds (`champion_num_boost_round`, carried over from the HPO champion run). The
+# MAGIC final fit does **NOT** early-stop on VAL and never puts VAL in its `evals` watchlist.
+# MAGIC
+# MAGIC **Why no VAL early stopping here (the fix):** HPO already tuned the hyperparameters — including the
+# MAGIC boosting-round count — against VAL. If the final fit early-stopped on VAL again, VAL would be
+# MAGIC double-used and the calibration + F2-threshold + decile edges derived from it in SECTION 6 would be
+# MAGIC optimistically biased. By freezing the round count from HPO and keeping VAL out of the fit entirely,
+# MAGIC **VAL becomes a genuine holdout** used ONLY for calibration / threshold / decile-edge selection, and
+# MAGIC TEST stays sealed for the single final eval. The fit stays TRAIN-only (VAL is not folded back in).
+# MAGIC
+# MAGIC If the champion run logged no `champion_num_boost_round`, this cell **FAILS FAST** rather than
+# MAGIC silently falling back to VAL early stopping.
 
 # COMMAND ----------
 
 import xgboost as xgb
+
+# FAIL FAST if the frozen champion round count is unavailable — never silently re-introduce VAL early
+# stopping (that would double-use the calibration/threshold holdout). `_champ_num_round` was loaded from the
+# HPO champion run in cell 1b.
+if _champ_num_round is None:
+    raise ValueError(
+        "The HPO champion run logged no `champion_num_boost_round`, so the frozen boosting-round count is "
+        "unavailable. Refusing to early-stop the final fit on VAL — that would double-use the VAL fold that "
+        "calibration + threshold selection rely on as a genuine holdout. Re-run HPO so the champion logs "
+        "champion_num_boost_round, or point hpo_champion_run_id at a run that has it. FAILING FAST."
+    )
+best_num_round = _champ_num_round  # FROZEN: exactly the rounds HPO's champion was evaluated at
 
 champ_params = {
     "objective": "binary:logistic",
@@ -788,23 +814,19 @@ if IMBALANCE_STRATEGY != "tune_spw_no_undersample":
     champ_params["scale_pos_weight"] = 1.0  # fix (a): no double correction under undersampling
 
 _dtrain = xgb.DMatrix(X_tr.to_numpy(dtype="float32"), label=y_tr.to_numpy(dtype="int32"), feature_names=FEATURE_NAMES)
+# _dval is a scoring matrix ONLY — it feeds the VAL calibration/threshold/decile fit in SECTION 6. It is
+# deliberately NOT passed to xgb.train below (no `evals`, no `early_stopping_rounds`) so VAL never touches
+# the fit and stays a genuine holdout.
 _dval = xgb.DMatrix(X_val.to_numpy(dtype="float32"), label=y_val.to_numpy(dtype="int32"), feature_names=FEATURE_NAMES)
 
 champion = xgb.train(
     champ_params,
     _dtrain,
-    num_boost_round=MAX_BOOST_ROUNDS,
-    evals=[(_dtrain, "train"), (_dval, "validation")],  # early stopping watches the LAST eval (validation)
-    early_stopping_rounds=EARLY_STOPPING_ROUNDS,
+    num_boost_round=best_num_round,  # FROZEN from HPO — no early stopping, no VAL watchlist
     verbose_eval=False,
 )
-best_iteration = int(getattr(champion, "best_iteration", MAX_BOOST_ROUNDS - 1))
-best_num_round = best_iteration + 1
-print(f"Champion fit on TRAIN ({X_tr.shape[0]:,} rows). best_num_round (early stopping on VAL): {best_num_round}")
-if _champ_num_round is not None and _champ_num_round != best_num_round:
-    print(f"NOTE: re-derived rounds ({best_num_round}) != champion-logged rounds ({_champ_num_round}). "
-          f"Expected identical for the same as_of_date/seed — a difference implies data drift or a different "
-          f"cutoff. Using the re-derived value (consistent with the data at this as_of).")
+print(f"Champion fit on TRAIN ({X_tr.shape[0]:,} rows) for the FROZEN {best_num_round} rounds "
+      f"(champion_num_boost_round from HPO). VAL was NOT used in the fit.")
 
 # COMMAND ----------
 
@@ -841,7 +863,7 @@ def best_f2_threshold(y_true, proba):
     return best_t, float(best_f2)
 
 
-# Uncalibrated VAL scores (using the frozen early-stopping round count).
+# Uncalibrated VAL scores (FROZEN round count). VAL never touched the fit, so it is a genuine holdout here.
 val_uncal = champion.predict(_dval, iteration_range=(0, best_num_round))
 _y_val = y_val.to_numpy()
 
@@ -1043,23 +1065,48 @@ print(_lift.to_string())
 # COMMAND ----------
 
 # --- Register: set UC registry, log the pyfunc + metrics, resolve the new version --------------------
+import time
+
 mlflow.set_registry_uri("databricks-uc")
 # Registry ops MUST target UC. `_client` (created earlier) reads tracking runs; use a UC-scoped client for
 # registration/alias so version lookups and aliases land in Unity Catalog, not the workspace registry.
 _uc_client = MlflowClient(registry_uri="databricks-uc")
 
 
-def _resolve_registered_version(client, model_info, model_name, run_id):
-    """Resolve the just-registered UC version robustly (ModelInfo.registered_model_version is unreliable)."""
-    v = getattr(model_info, "registered_model_version", None)
-    if v is not None:
-        return str(v)
-    mvs = client.search_model_versions(f"name='{model_name}'")
-    matches = [mv for mv in mvs if getattr(mv, "run_id", None) == run_id]
-    pool = matches or mvs
-    if not pool:
-        raise RuntimeError(f"Could not resolve the registered version for {model_name} (run {run_id}).")
-    return str(sorted(pool, key=lambda m: int(m.version))[-1].version)
+def _resolve_registered_version(client, model_name, run_id, max_attempts=6, base_delay=0.5):
+    """Resolve the just-registered UC version by EXACT `run_id` match ONLY — never 'latest'.
+
+    ``ModelInfo.registered_model_version`` is not reliably populated across MLflow versions, and falling back
+    to the newest version is unsafe: under concurrent registrations the newest version could belong to a
+    DIFFERENT model, which would then be aliased. So the version is found by matching model versions on THIS
+    run's id. Registration can lag a moment behind ``log_model``, so we poll with bounded exponential backoff
+    and, if no version whose ``run_id``/``source`` matches this run appears within the bound, we RAISE.
+    """
+    def _matches_run(mv):
+        if getattr(mv, "run_id", None) == run_id:
+            return True
+        # Some backends leave run_id empty but set source to 'runs:/<run_id>/<artifact_path>'.
+        src = getattr(mv, "source", "") or ""
+        return f"/{run_id}/" in src or src.endswith(f"/{run_id}")
+
+    last_err = None
+    for attempt in range(max_attempts):
+        try:
+            mvs = client.search_model_versions(f"name='{model_name}'")
+            exact = [mv for mv in mvs if _matches_run(mv)]
+            if exact:
+                # Exact run_id match only. If (pathologically) several versions map to this one run, take the
+                # newest OF THOSE MATCHES — still never an unrelated version.
+                return str(sorted(exact, key=lambda m: int(m.version))[-1].version)
+        except Exception as exc:  # transient search / propagation error -> retry within the bound
+            last_err = exc
+        if attempt < max_attempts - 1:
+            time.sleep(min(base_delay * (2 ** attempt), 8.0))
+    raise RuntimeError(
+        f"Could not resolve a registered version of {model_name} whose run_id matches {run_id} after "
+        f"{max_attempts} attempts. Refusing to fall back to the latest version (it could be an unrelated / "
+        f"concurrently registered model). Last search error: {last_err}."
+    )
 
 
 with mlflow.start_run(run_name="fop_model_registration") as run:
@@ -1078,7 +1125,7 @@ with mlflow.start_run(run_name="fop_model_registration") as run:
         "selected_store_features": ",".join(_numeric_present),
         "include_segment": INCLUDE_SEGMENT,
         "target_neg_per_pos": TARGET_NEG_PER_POS,
-        "early_stopping_rounds": EARLY_STOPPING_ROUNDS,
+        "num_boost_round_source": "hpo_champion_frozen",  # no VAL early stopping in the final fit
         "champion_num_boost_round": best_num_round,
         "calibrate": CALIBRATE,
         "n_features": len(FEATURE_NAMES),
@@ -1114,7 +1161,7 @@ with mlflow.start_run(run_name="fop_model_registration") as run:
     run_id = run.info.run_id
     print(f"Logged + registered pyfunc in run {run_id}")
 
-registered_version = _resolve_registered_version(_uc_client, model_info, REGISTERED_MODEL_NAME, run_id)
+registered_version = _resolve_registered_version(_uc_client, REGISTERED_MODEL_NAME, run_id)
 print(f"Registered {REGISTERED_MODEL_NAME} version {registered_version}")
 
 # COMMAND ----------
@@ -1134,7 +1181,9 @@ except Exception as _exc:
 # MAGIC %md
 # MAGIC ## SECTION 9 — Alias + the champion-promotion GATE
 # MAGIC **DEFAULT (`alias_mode=auto`)**: set `@champion` only if the model has **no** champion yet; otherwise
-# MAGIC set `@challenger`. A freshly trained version is **never** auto-promoted over a live champion.
+# MAGIC set `@challenger`. A freshly trained version is **never** auto-promoted over a live champion — and even
+# MAGIC an explicit `alias_mode=champion` is **REFUSED (raises)** when a champion already exists on a different
+# MAGIC version. Moving a live champion is possible only via the explicit human promotion command below.
 # MAGIC
 # MAGIC ### Champion-promotion gate (a human decision — do NOT automate here)
 # MAGIC Promoting a `@challenger` to `@champion` is a deliberate, reviewed step, not a side effect of training.
@@ -1171,12 +1220,27 @@ elif ALIAS_MODE == "auto":
 else:
     chosen_alias = ALIAS_MODE  # explicit 'champion' or 'challenger'
 
+# HARD promotion gate: a new version may take @champion ONLY when the model has no champion yet. If a
+# champion already exists on a DIFFERENT version, REFUSE to overwrite it here (raise) — promoting over a
+# live champion is an explicit, human-gated decision, not a training side effect. This holds regardless of
+# alias_mode, so `alias_mode=champion` cannot bypass the gate.
+if chosen_alias == "champion" and existing_champion is not None and str(existing_champion) != str(registered_version):
+    raise RuntimeError(
+        f"Refusing to move @champion from live version v{existing_champion} to v{registered_version}. "
+        f"Promoting over an existing champion is a human-gated decision, not a side effect of training. "
+        f"This version is registered and available as a challenger candidate; compare it against the "
+        f"incumbent on the same as-of split, and if it wins, run the explicit promotion command:\n"
+        f"    MlflowClient(registry_uri='databricks-uc').set_registered_model_alias("
+        f"'{REGISTERED_MODEL_NAME}', 'champion', '{registered_version}')"
+    )
+
 if chosen_alias is None:
     print(f"alias_mode=none -> version {registered_version} registered without an alias.")
+elif chosen_alias == "champion" and existing_champion is not None:
+    # existing_champion == registered_version here (the gate above already rejected any mismatch), so this
+    # is an idempotent no-op rather than an overwrite of a different live champion.
+    print(f"@champion already points to version {registered_version} — leaving it in place (idempotent).")
 else:
-    if chosen_alias == "champion" and existing_champion is not None and str(existing_champion) != str(registered_version):
-        print(f"WARNING: forcing @champion onto version {registered_version} over live champion "
-              f"v{existing_champion}. This bypasses the promotion gate above — make sure this is intended.")
     _uc_client.set_registered_model_alias(REGISTERED_MODEL_NAME, chosen_alias, registered_version)
     print(f"Set @{chosen_alias} -> {REGISTERED_MODEL_NAME} version {registered_version} "
           f"(existing champion before this run: {existing_champion}).")
