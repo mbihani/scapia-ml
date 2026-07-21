@@ -144,11 +144,14 @@ EXPECTED_MODEL_OUTPUT_COLS = ["raw_score", "calibrated_probability", "decile"]
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 1a. Widgets — scoring date + model alias + output target (fail-fast on required config)
+# MAGIC ## 1a. Widgets — scoring date + model name + output target (fail-fast on required config)
 # MAGIC * `scoring_date` — the as-of cutoff. **Blank = latest as-of**, derived with the SAME orders probe the
 # MAGIC   sibling notebooks use for their default, but **without** subtracting the performance window (there is no
 # MAGIC   forward label to reserve at scoring time — see the resolver's docstring).
-# MAGIC * `registered_model_name` + `model_alias` — the champion is loaded by **alias only** (never a version).
+# MAGIC * `registered_model_name` — the three-level UC model name. The alias is **not** a widget: it is the
+# MAGIC   code-level constant `MODEL_ALIAS = "champion"` (see the cell below), so the champion is loaded by
+# MAGIC   **alias only** (never a version) and a scheduled job cannot be silently repointed. Challenger / shadow
+# MAGIC   scoring is out of scope and would require a code edit.
 # MAGIC * `output_catalog` / `output_schema` / `output_table` — the NEW governed scores table. The default is a
 # MAGIC   **new** table, deliberately NOT the existing `mlops_data_science.default.first_order_propen_output`
 # MAGIC   (we do not silently change the schema of whatever a current job writes).
