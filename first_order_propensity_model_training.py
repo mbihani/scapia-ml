@@ -1204,11 +1204,23 @@ except Exception as _exc:
 # COMMAND ----------
 
 # --- Apply the alias per alias_mode (auto = champion if none exists, else challenger) -----------------
+from mlflow.exceptions import RestException
+
+# The promotion gate MUST fail CLOSED. `get_model_version_by_alias` raises RestException when the alias is
+# absent (error_code RESOURCE_DOES_NOT_EXIST). If we swallowed EVERY exception and returned None, a
+# transient/auth/throttle/internal error would be misread as "no champion exists" and let a new version take
+# @champion over a LIVE champion — defeating the gate. So we return None ONLY for the precise not-found
+# signal and RE-RAISE everything else (other RestExceptions AND any non-Rest exception propagates untouched).
+_ALIAS_NOT_FOUND_CODE = "RESOURCE_DOES_NOT_EXIST"
+
+
 def _current_alias_version(client, model_name, alias):
     try:
         return client.get_model_version_by_alias(model_name, alias).version
-    except Exception:
-        return None
+    except RestException as exc:
+        if getattr(exc, "error_code", None) == _ALIAS_NOT_FOUND_CODE:
+            return None  # alias genuinely does not exist yet -> there is no current champion
+        raise  # auth / throttling / internal / any other registry error -> fail LOUD, never overwrite blind
 
 
 existing_champion = _current_alias_version(_uc_client, REGISTERED_MODEL_NAME, "champion")
