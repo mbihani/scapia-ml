@@ -168,10 +168,6 @@ dbutils.widgets.text(
     "registered_model_name", "mlops_data_science.models.first_order_propensity",
     "Three-level UC model name (catalog.schema.model).",
 )
-dbutils.widgets.text(
-    "model_alias", "champion",
-    "Registry alias to score with. Scoring uses the PROMOTED champion only (challenger scoring is out of scope).",
-)
 dbutils.widgets.text("output_catalog", "mlops_data_science", "Output catalog for the scores table.")
 dbutils.widgets.text("output_schema", "default", "Output schema for the scores table.")
 dbutils.widgets.text(
@@ -180,7 +176,6 @@ dbutils.widgets.text(
 )
 
 REGISTERED_MODEL_NAME = dbutils.widgets.get("registered_model_name").strip()
-MODEL_ALIAS = dbutils.widgets.get("model_alias").strip()
 OUTPUT_CATALOG = dbutils.widgets.get("output_catalog").strip()
 OUTPUT_SCHEMA = dbutils.widgets.get("output_schema").strip()
 OUTPUT_TABLE_NAME = dbutils.widgets.get("output_table").strip()
@@ -190,10 +185,15 @@ if REGISTERED_MODEL_NAME.count(".") != 2:
         f"registered_model_name must be a three-level UC name 'catalog.schema.model'; got "
         f"'{REGISTERED_MODEL_NAME}'. FAILING FAST."
     )
-if not MODEL_ALIAS:
-    raise ValueError("`model_alias` widget is empty. Set it to the registry alias to score (e.g. 'champion'). FAILING FAST.")
 if not (OUTPUT_CATALOG and OUTPUT_SCHEMA and OUTPUT_TABLE_NAME):
     raise ValueError("output_catalog / output_schema / output_table must all be non-empty. FAILING FAST.")
+
+# STRICTLY champion-pinned — a code-level CONSTANT, deliberately NOT a runtime widget, so a scheduled job can
+# never be silently repointed at another alias and score with a non-promoted model. Scoring runs the PROMOTED
+# @champion ONLY; challenger / shadow scoring is intentionally OUT OF SCOPE. This stays ALIAS-based (not a
+# hard-coded version): it always follows whichever version is currently promoted to @champion. Changing this
+# requires an explicit code edit, not a widget change.
+MODEL_ALIAS = "champion"
 
 OUTPUT_TABLE = f"{OUTPUT_CATALOG}.{OUTPUT_SCHEMA}.{OUTPUT_TABLE_NAME}"
 MODEL_URI = f"models:/{REGISTERED_MODEL_NAME}@{MODEL_ALIAS}"  # ALIAS ONLY — never a hard-coded version
@@ -625,9 +625,10 @@ except Exception as _exc:  # noqa: BLE001 — lineage is best-effort; the scores
 # MAGIC             notebook_task=jobs.NotebookTask(
 # MAGIC                 notebook_path="/Repos/scapia-ml/feature_store/first_order_propensity_batch_scorer",
 # MAGIC                 base_parameters={
+# MAGIC                     # NOTE: there is no model-alias parameter — the scorer is champion-pinned in code
+# MAGIC                     # (MODEL_ALIAS="champion"). Promotion is the only way to change what is scored.
 # MAGIC                     "scoring_date": "",  # blank = latest as-of; set a date for a backfill
 # MAGIC                     "registered_model_name": "mlops_data_science.models.first_order_propensity",
-# MAGIC                     "model_alias": "champion",
 # MAGIC                     "output_catalog": "mlops_data_science",
 # MAGIC                     "output_schema": "default",
 # MAGIC                     "output_table": "first_order_propensity_scores",
