@@ -352,6 +352,21 @@ monitored_src = monitored_src.cache()
 _n_rows = monitored_src.count()
 _n_labeled = monitored_src.filter("label IS NOT NULL").count()
 _n_positive = monitored_src.filter("label = 1").count()
+
+# Surface the label-observation watermark (the maturity cutoff that decided which windows are labeled).
+# Read-only probe of the SAME expression the source CTE uses; additive telemetry, not part of monitor logic.
+_watermark_row = spark.sql(
+    f"""
+    SELECT CAST(MAX(CAST(created_at AS timestamp)) + INTERVAL {IST_OFFSET_MINUTES} MINUTE AS timestamp)
+               AS label_observed_until
+    FROM {ORDERS_TABLE}
+    WHERE status IN ({_sql_in_list(QUALIFYING_STATUSES)})
+      AND product_category IN ({_sql_in_list(QUALIFYING_PRODUCT_CATEGORIES)})
+    """
+).first()
+LABEL_WATERMARK = _watermark_row["label_observed_until"] if _watermark_row else None
+
+print(f"Label watermark (IST) : {LABEL_WATERMARK}  (windows ending at/before this are matured)")
 print(f"Monitored source rows : {_n_rows:,}")
 print(f"  matured (label known): {_n_labeled:,}  ({_n_labeled / max(_n_rows, 1):.1%})")
 print(f"  positives so far     : {_n_positive:,}")
@@ -387,9 +402,21 @@ if not spark.catalog.tableExists(MONITORED_TABLE):
         """
     )
     _merge_mode = "created new monitored table (CDF enabled)"
+    _n_backfilled = 0  # brand-new table -> no prior NULL labels to flip
 else:
-    _set_clause = ",\n            ".join(f"t.{c} = s.{c}" for c in _SET_COLS)
     _on_clause = " AND ".join(f"t.{k} = s.{k}" for k in _KEYS)
+    # Additive telemetry BEFORE the MERGE: how many existing rows have a NULL label that the fresh source now
+    # observes (NULL -> 0/1). Read-only count; does not alter the MERGE below.
+    _n_backfilled = spark.sql(
+        f"""
+        SELECT COUNT(*) AS n
+        FROM {MONITORED_TABLE} t
+        JOIN {_SRC_VIEW} s ON {_on_clause}
+        WHERE t.label IS NULL AND s.label IS NOT NULL
+        """
+    ).first()["n"]
+
+    _set_clause = ",\n            ".join(f"t.{c} = s.{c}" for c in _SET_COLS)
     spark.sql(
         f"""
         MERGE INTO {MONITORED_TABLE} t
@@ -404,6 +431,7 @@ else:
 
 _tbl_rows = spark.table(MONITORED_TABLE).count()
 print(f"{MONITORED_TABLE}: {_tbl_rows:,} rows [{_merge_mode}]")
+print(f"  labels backfilled this run (NULL -> observed): {_n_backfilled:,}")
 
 # COMMAND ----------
 
@@ -423,9 +451,25 @@ print(f"{MONITORED_TABLE}: {_tbl_rows:,} rows [{_merge_mode}]")
 # MAGIC   {{base_df}}.fop_top_decile_lift` — the window-over-window change in lift, i.e. **lift decay**, which
 # MAGIC   the retraining trigger reads.
 # MAGIC
-# MAGIC (Grounded in the confirmed custom-metric syntax: `` `{{input_column}}` `` is not needed for these because
-# MAGIC they span multiple columns, so `input_columns=[":table"]`; derived metrics reference prior aggregate
-# MAGIC **names**; `output_data_type` is a Spark-type JSON string.)
+# MAGIC ### `input_columns` semantics (grounded against the current docs — read this before "fixing" it)
+# MAGIC `input_columns` is documented as *"a list of column names **in the input table** the metric should be
+# MAGIC computed for; use `:table` to indicate that more than one column is used."* It is therefore **always raw
+# MAGIC table column names or `:table` — never a metric name**. The dependency on another metric is expressed
+# MAGIC **only in `definition`** (by writing the other metric's name in the SQL), NOT in `input_columns`. The
+# MAGIC official examples confirm this exactly:
+# MAGIC * aggregate `weighted_error` — reads raw cols (`prediction`, `label`, `critical`) but spans several, so
+# MAGIC   `input_columns=[":table"]`. **This is precisely our TP/FP/FN pattern** (each spans
+# MAGIC   `predicted_label` + `label` + `decile`), so our aggregates use `[":table"]`.
+# MAGIC * derived `root_mean_square = sqrt(squared_avg)` — the dependency `squared_avg` appears **only in
+# MAGIC   `definition`**; `input_columns` mirrors the columns its underlying aggregate was computed over.
+# MAGIC * drift `error_rate_delta` — tracks the `weighted_error` metric (itself a `:table` aggregate) and uses
+# MAGIC   **`input_columns=[":table"]` verbatim**. Our `fop_top_decile_lift_delta` is the same shape.
+# MAGIC
+# MAGIC So: our derived + drift metrics build on **`:table`-scoped** aggregates, and the documented pattern is
+# MAGIC that a derived/drift metric's `input_columns` mirrors its aggregate dependencies' `input_columns` (all
+# MAGIC `:table` here). Putting metric names into `input_columns` would be **wrong** (they are not table
+# MAGIC columns). Ref: `https://docs.databricks.com/aws/en/lakehouse-monitoring/custom-metrics` (and the SDK
+# MAGIC `MonitorMetric` docstring in `databricks.sdk.service.catalog`, retrieved 2026-07-22).
 
 # COMMAND ----------
 
@@ -486,11 +530,21 @@ CUSTOM_METRICS = [
         definition="SUM(CASE WHEN label IS NOT NULL THEN 1 ELSE 0 END)",
         output_data_type=_LONG,
     ),
-    # --- DERIVED metrics: reference the aggregate NAMES above; NULL-safe via nullif ----------------------
+    # --- DERIVED metrics -------------------------------------------------------------------------------
+    # The dependency on the aggregates above is expressed ONLY in `definition` (their names appear in the SQL).
+    # `input_columns` stays a table-scope descriptor, NOT a metric-name list (per the docs: input_columns is
+    # "column names in the input table" / ":table"). Because every aggregate these derive from is itself
+    # `:table`-scoped (each spans predicted_label + label + decile), `:table` is the matching descriptor here.
+    # TODO(verify-api): the docs' only derived example (sqrt(squared_avg)) derives from a SINGLE-column-list
+    # aggregate and so uses that aggregate's input_columns (["f1","f2"]). There is NO verbatim example of a
+    # derived metric built on a `:table`-scoped aggregate; by the documented rule (mirror the dependency's
+    # input_columns) that is `:table`, which we use. If a future SDK/monitor version rejects `:table` on a
+    # derived metric, the alternative to try is the exact set of raw columns the underlying aggregates read
+    # (["predicted_label", "label", "decile"]). Confirm on the live monitor's create() response.
     MonitorMetric(
         type=MonitorMetricType.CUSTOM_METRIC_TYPE_DERIVED,
         name="fop_top_decile_lift",
-        input_columns=[":table"],
+        input_columns=[":table"],  # derives from :table aggregates (fop_decile1_* / fop_labeled_*)
         definition=(
             "(fop_decile1_bookers / nullif(fop_decile1_users, 0)) "
             "/ nullif(fop_labeled_bookers / nullif(fop_labeled_users, 0), 0)"
@@ -500,7 +554,7 @@ CUSTOM_METRICS = [
     MonitorMetric(
         type=MonitorMetricType.CUSTOM_METRIC_TYPE_DERIVED,
         name="fop_f2",
-        input_columns=[":table"],
+        input_columns=[":table"],  # derives from :table aggregates (fop_true_positive / _false_* )
         definition=(
             "(5.0 * fop_true_positive) "
             "/ nullif((5.0 * fop_true_positive) + (4.0 * fop_false_negative) + fop_false_positive, 0)"
@@ -508,6 +562,9 @@ CUSTOM_METRICS = [
         output_data_type=_DOUBLE,
     ),
     # --- DRIFT metric: window-over-window change in lift == lift decay -----------------------------------
+    # input_columns=[":table"] is VERBATIM the documented drift shape: the doc's `error_rate_delta` drift
+    # metric tracks the `weighted_error` metric via {{current_df}}/{{base_df}} and uses input_columns=[":table"].
+    # The dependency (fop_top_decile_lift) is named ONLY in the definition, exactly as the doc example does.
     MonitorMetric(
         type=MonitorMetricType.CUSTOM_METRIC_TYPE_DRIFT,
         name="fop_top_decile_lift_delta",
@@ -608,6 +665,23 @@ def create_or_update_monitor():
         action = "created new"
     return info, action
 
+
+# Pre-creation guard (additive, fail-fast): confirm the monitored table actually carries every column the
+# monitor config references — the InferenceLog columns, the slicing columns, and the raw columns the custom
+# metrics read (predicted_label / label / decile). Catches a schema drift BEFORE we hand the monitor a config
+# that would fail server-side. Custom-metric NAMES are outputs, not columns, so they are not checked here.
+_monitored_cols = set(spark.table(MONITORED_TABLE).columns)
+_required_monitor_cols = {
+    "predicted_label", SCORE_PROBA_COL, "label", "scoring_ts", MODEL_VERSION_COL, DECILE_COL,
+} | set(SLICING_EXPRS)
+_missing = sorted(_required_monitor_cols - _monitored_cols)
+if _missing:
+    raise ValueError(
+        f"{MONITORED_TABLE} is missing columns the monitor config requires: {_missing}. "
+        f"Present columns: {sorted(_monitored_cols)}. Refusing to create/update the monitor against a "
+        f"table that does not satisfy the InferenceLog/slicing/custom-metric contract. FAILING FAST."
+    )
+print(f"Pre-creation column check OK — monitored table has all required columns: {sorted(_required_monitor_cols)}")
 
 monitor_info, _action = create_or_update_monitor()
 print(f"Monitor {_action} on {MONITORED_TABLE}")
