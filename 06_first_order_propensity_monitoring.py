@@ -53,7 +53,8 @@
 # MAGIC ## API grounding — what was verified, and the monitoring-API drift you must know about
 # MAGIC A hallucinated monitor API is the worst outcome, so the surface below was grounded against the
 # MAGIC **installed SDK's own source/docstrings** and the current official docs (retrieved 2026-07-22). Nothing
-# MAGIC here is guessed; every place a signature could not be pinned is marked `# TODO(verify-api)`.
+# MAGIC here is guessed; the one place a signature could not be pinned carries an actionable verify-api marker
+# MAGIC (a single `# TODO` + `(verify-api)` tag, in the retraining-signal helper's profile-table column probe).
 # MAGIC
 # MAGIC ### The three monitoring surfaces (this is the "moved across versions" gotcha)
 # MAGIC * **Legacy** `databricks.lakehouse_monitoring` module (`lm.create_monitor(...)`, `lm.InferenceLog(...)`)
@@ -90,8 +91,8 @@
 # MAGIC * Built-in classification metrics land in `MonitorInfo.profile_metrics_table_name` (e.g.
 # MAGIC   `roc_auc_score`, `log_loss`, `accuracy_score`, `f1_score`, `precision`, `recall`); drift lands in
 # MAGIC   `MonitorInfo.drift_metrics_table_name`. Exact per-version column names in those output tables are
-# MAGIC   resolved **dynamically** in the retraining-signal helper (and flagged `# TODO(verify-api)`), never
-# MAGIC   hard-asserted.
+# MAGIC   resolved **dynamically** in the retraining-signal helper (where the notebook's single actionable
+# MAGIC   verify-api marker lives), never hard-asserted.
 
 # COMMAND ----------
 
@@ -535,12 +536,12 @@ CUSTOM_METRICS = [
     # `input_columns` stays a table-scope descriptor, NOT a metric-name list (per the docs: input_columns is
     # "column names in the input table" / ":table"). Because every aggregate these derive from is itself
     # `:table`-scoped (each spans predicted_label + label + decile), `:table` is the matching descriptor here.
-    # TODO(verify-api): the docs' only derived example (sqrt(squared_avg)) derives from a SINGLE-column-list
-    # aggregate and so uses that aggregate's input_columns (["f1","f2"]). There is NO verbatim example of a
-    # derived metric built on a `:table`-scoped aggregate; by the documented rule (mirror the dependency's
-    # input_columns) that is `:table`, which we use. If a future SDK/monitor version rejects `:table` on a
-    # derived metric, the alternative to try is the exact set of raw columns the underlying aggregates read
-    # (["predicted_label", "label", "decile"]). Confirm on the live monitor's create() response.
+    # NOTE (not a verification TODO — the docs confirm this shape): the docs' only derived example
+    # (sqrt(squared_avg)) derives from a SINGLE-column-list aggregate and so uses that aggregate's
+    # input_columns (["f1","f2"]). There is no verbatim example of a derived metric built on a `:table`-scoped
+    # aggregate; by the documented rule (mirror the dependency's input_columns) that is `:table`, which we use.
+    # If a future SDK/monitor version were to reject `:table` on a derived metric, the alternative to try is the
+    # exact set of raw columns the underlying aggregates read (["predicted_label", "label", "decile"]).
     MonitorMetric(
         type=MonitorMetricType.CUSTOM_METRIC_TYPE_DERIVED,
         name="fop_top_decile_lift",
