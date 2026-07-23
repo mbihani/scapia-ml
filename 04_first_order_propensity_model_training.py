@@ -622,10 +622,18 @@ class FirstOrderPropensityModel(mlflow.pyfunc.PythonModel):
             parts.append(col.rename(c))
         for c in pp["categorical_features"]:
             cats = pp["vocab"][c]
-            if c in pdf_part.columns:
-                vals = pdf_part[c].astype("object").fillna("No Segment")
-            else:
-                vals = pd.Series("No Segment", index=pdf_part.index, dtype="object")
+            if c not in pdf_part.columns:
+                # FAIL CLOSED: the model was TRAINED with this categorical input, so its wholesale absence at
+                # predict time is a train/serve-skew bug (e.g. the scorer dropped the passthrough), NOT a
+                # legitimately-null per-user value. Substituting a default for EVERY row would silently score
+                # the whole population as one category. The per-user null/unseen path below (column present,
+                # individual value NaN/rare -> "No Segment"/"Other") remains the only legitimate defaulting.
+                raise ValueError(
+                    f"Required categorical input column '{c}' is entirely absent from the model input. The model "
+                    f"was trained expecting it; refusing to substitute a default for every row (that would score "
+                    f"the whole batch as one category). Supply column '{c}'. FAILING FAST."
+                )
+            vals = pdf_part[c].astype("object").fillna("No Segment")
             vals = vals.where(vals.isin(cats), "Other")          # unseen/rare -> explicit Other bucket
             vals = pd.Categorical(vals, categories=cats)          # FIXED categories -> stable, complete columns
             dummies = pd.get_dummies(vals, prefix=c, dtype="float32")

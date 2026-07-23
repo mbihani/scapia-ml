@@ -74,9 +74,15 @@
 # MAGIC   `@champion` alias to a concrete `ModelVersion` (`.version`, `.run_id`). Raises `RESOURCE_DOES_NOT_EXIST`
 # MAGIC   when the alias is absent — we surface that as a fail-loud error.
 # MAGIC   Ref: `https://mlflow.org/docs/latest/api_reference/python_api/mlflow.client.html`
-# MAGIC * `include_segment` / the store-feature subset are read back from the champion's **training run params**
-# MAGIC   (logged in SECTION 8 of the training notebook) rather than re-derived, so the scorer's spine matches
-# MAGIC   what the model was trained + packaged with — no hardcoded feature list.
+# MAGIC * `mlflow.models.get_model_info(model_uri).signature.inputs.input_names()` — reads the champion's logged
+# MAGIC   **input signature** (MLmodel metadata; no pyfunc instantiation). This is the AUTHORITATIVE, deterministic
+# MAGIC   source for whether the model expects the current-state `segment` passthrough: a signature is mandatory
+# MAGIC   for UC registration, and `segment` is a passthrough source column (never a `FeatureLookup`), so it is in
+# MAGIC   the declared inputs iff the model was trained with it. Unreadable / missing signature → **RAISE**
+# MAGIC   (fail-closed); no silent default that would drop a required input. Read via the **version-pinned** URI
+# MAGIC   `models:/<name>/<version>` (the form the docs document for `get_model_info`; the alias form is resolved
+# MAGIC   to that version first), while `score_batch` still loads by the `@champion` alias URI.
+# MAGIC   Ref: `https://mlflow.org/docs/latest/api_reference/python_api/mlflow.models.html`
 
 # COMMAND ----------
 
@@ -219,13 +225,19 @@ print(f"Output table  : {OUTPUT_TABLE}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## SECTION 1 — Resolve the champion (ALIAS ONLY)
+# MAGIC ## SECTION 1 — Resolve the champion (ALIAS ONLY) + read its segment contract from the SIGNATURE
 # MAGIC The alias is resolved to a concrete version + run_id for the provenance columns. **Fail loud** if the
-# MAGIC `@champion` alias does not resolve — we never fall back to a version. We do **not** load the pyfunc or
-# MAGIC build a feature matrix here: `fe.score_batch` (Section 4) loads the model by URI and auto-joins the
-# MAGIC packaged features. `include_segment` is read back from the champion's **training run params** (logged in
-# MAGIC the training notebook's SECTION 8) so we know whether to attach the current-state `segment` passthrough
-# MAGIC the model expects — deterministic, not re-derived from a feature list.
+# MAGIC `@champion` alias does not resolve — we never fall back to a version. We do **not** build a feature
+# MAGIC matrix here: `fe.score_batch` (Section 4) auto-joins the packaged store features.
+# MAGIC
+# MAGIC Whether the model expects the current-state `segment` passthrough is derived from the **champion model's
+# MAGIC own logged signature** — the AUTHORITATIVE, deterministic source (a signature is mandatory for UC
+# MAGIC registration). Because `segment` is a **passthrough** column (never a `FeatureLookup` — finding #1, no
+# MAGIC as-of table), it appears in the model's input contract **iff** the model was trained with it, regardless
+# MAGIC of whether `fe.log_model` stored the raw-feature signature or a keys+passthrough one. This **fails
+# MAGIC CLOSED**: if the signature is missing/unreadable, or (later) the segment source cannot be built when the
+# MAGIC model requires it, we RAISE — never silently drop segment (which would score the whole population as one
+# MAGIC value). No fallible side-channel that defaults to "omit".
 
 # COMMAND ----------
 
@@ -254,26 +266,52 @@ def resolve_champion(client, model_name, alias):
 CHAMPION_VERSION, CHAMPION_RUN_ID = resolve_champion(_uc_client, REGISTERED_MODEL_NAME, MODEL_ALIAS)
 print(f"Resolved @{MODEL_ALIAS} -> version {CHAMPION_VERSION} (run_id {CHAMPION_RUN_ID or 'unknown'})")
 
-# Whether the model uses current-state `segment` is read back from the champion's TRAINING run params
-# (logged as `include_segment` in the training notebook's SECTION 8). We do NOT load the pyfunc or inspect a
-# feature list here: fe.score_batch (Section 4) auto-joins the packaged store features, and segment is the
-# only passthrough column the scorer must supply on the spine. Default False (segment not attached) if the
-# param is absent — the model simply would not have been packaged with a segment input in that case.
-def _resolve_include_segment(client, run_id):
-    """Read `include_segment` from the champion's training run params. Returns bool; defaults False if absent."""
-    if not run_id:
-        print("WARNING: champion has no run_id; cannot read include_segment from training params -> False.")
-        return False
+
+def _model_requires_segment(model_uri):
+    """Decide from the CHAMPION'S OWN SIGNATURE whether it expects the current-state `segment` passthrough.
+
+    AUTHORITATIVE + deterministic: a signature is mandatory for UC registration, so the logged input schema is
+    the ground truth for the model's input contract. `segment` is a PASSTHROUGH source column (never a
+    FeatureLookup — finding #1, no as-of table), so it is declared in the model's inputs *iff* the model was
+    trained with it — this holds whether fe.log_model stored the raw-feature signature or a keys+passthrough
+    one (in both, a passthrough source column must appear in the declared inputs).
+
+    FAIL CLOSED: if the signature or its inputs cannot be read (missing / unnamed / unreadable), RAISE. Never
+    return a default that would let the scorer silently drop segment and score the whole population as one
+    value. Read via mlflow.models.get_model_info (MLmodel metadata only — no pyfunc instantiation needed).
+
+    NOTE: the metadata read uses the VERSION-pinned URI (`models:/<name>/<version>`), which the MLflow docs
+    explicitly document for get_model_info — the alias form `models:/<name>@<alias>` is not documented there,
+    so relying on it could raise spuriously and break every run. The version was resolved from @champion in
+    this same cell, so it is authoritatively the champion; fe.score_batch still loads by the alias URI.
+    """
     try:
-        raw = client.get_run(run_id).data.params.get("include_segment")
-    except Exception as exc:  # noqa: BLE001 — a missing/unreadable run should not silently attach segment
-        print(f"WARNING: could not read training run {run_id} params ({exc}); include_segment -> False.")
-        return False
-    return str(raw).strip().lower() == "true"
+        info = mlflow.models.get_model_info(model_uri)
+        sig = getattr(info, "signature", None)
+        input_names = list(sig.inputs.input_names()) if (sig is not None and sig.inputs is not None) else []
+    except Exception as exc:  # noqa: BLE001 — inability to read the contract must fail loud, never fail open
+        raise RuntimeError(
+            f"Could not read the champion's signature from {model_uri} to determine its segment input contract "
+            f"({type(exc).__name__}: {exc}). Refusing to guess whether segment is required — a wrong guess would "
+            f"score the whole population as one value. FAILING FAST."
+        ) from exc
+    if not input_names:
+        raise RuntimeError(
+            f"Champion at {model_uri} has no named input signature, so the segment input contract is "
+            f"undeterminable. A signature is mandatory for UC registration, so this indicates a malformed "
+            f"model. Refusing to guess segment inclusion (fail-closed). FAILING FAST."
+        )
+    required = [c for c in SUPPORTED_NON_STORE_FEATURES if c in input_names]
+    print(f"Champion signature inputs ({len(input_names)}): {input_names}")
+    return bool(required)
 
 
-INCLUDE_SEGMENT = _resolve_include_segment(MlflowClient(), CHAMPION_RUN_ID)  # tracking client reads run params
-print(f"  include segment (current-state passthrough): {INCLUDE_SEGMENT}")
+# Derive from the model's own signature (fail-closed), NOT from a fallible selection/run side-channel. Read
+# by the version-pinned URI (documented for get_model_info); it IS the champion (resolved from the alias
+# above). fe.score_batch below still loads by the @champion alias URI so scoring tracks promotions.
+_CHAMPION_VERSION_URI = f"models:/{REGISTERED_MODEL_NAME}/{CHAMPION_VERSION}"
+INCLUDE_SEGMENT = _model_requires_segment(_CHAMPION_VERSION_URI)
+print(f"  model requires segment passthrough: {INCLUDE_SEGMENT}")
 
 # COMMAND ----------
 
@@ -419,17 +457,32 @@ from databricks.feature_engineering import FeatureEngineeringClient
 fe = FeatureEngineeringClient()
 
 # Build the score_batch spine: keys + feature_ts, plus the current-state `segment` passthrough IF the model
-# uses it. NO FeatureLookup / create_training_set — score_batch auto-joins the packaged store features.
+# requires it. NO FeatureLookup / create_training_set — score_batch auto-joins the packaged store features.
 score_spine = population_df
 if INCLUDE_SEGMENT:
-    # Reproduces v7's `coalesce(usm.segment_name, 'No Segment') AS segment`, joined current-state — the same
-    # passthrough column the training-set spine carried, so the model receives segment exactly as at training.
-    segment_df = spark.sql(f"SELECT internal_user_id, segment_name FROM {USER_SEGMENT_MAPPING}")
-    score_spine = (
-        score_spine.join(segment_df, on=ENTITY_KEY, how="left")
-        .withColumnRenamed("segment_name", "segment")
-        .fillna({"segment": SEGMENT_DEFAULT})
-    )
+    # The champion's signature declares segment as an input, so the passthrough is REQUIRED. Build it or FAIL
+    # CLOSED — never proceed with segment silently dropped (the pyfunc would then score every row as one
+    # value). Reproduces v7's `coalesce(usm.segment_name, 'No Segment') AS segment`, joined current-state —
+    # the same passthrough column the training-set spine carried, so the model receives segment as at training.
+    try:
+        segment_df = spark.sql(f"SELECT internal_user_id, segment_name FROM {USER_SEGMENT_MAPPING}")
+        score_spine = (
+            score_spine.join(segment_df, on=ENTITY_KEY, how="left")
+            .withColumnRenamed("segment_name", "segment")
+            .fillna({"segment": SEGMENT_DEFAULT})
+        )
+    except Exception as exc:  # noqa: BLE001 — a required input that cannot be built must fail loud, not open
+        raise RuntimeError(
+            f"Champion requires the `segment` passthrough input (its signature declares it) but the segment "
+            f"source {USER_SEGMENT_MAPPING} could not be read/joined ({type(exc).__name__}: {exc}). Refusing to "
+            f"score with a required model input missing — that would score the whole population as one segment "
+            f"value. FAILING FAST."
+        ) from exc
+    if "segment" not in score_spine.columns:
+        raise RuntimeError(
+            "Champion requires the `segment` passthrough input but it is absent from the built scoring spine. "
+            "Refusing to score with a required model input missing (fail-closed). FAILING FAST."
+        )
 print(f"Score_batch spine columns: {score_spine.columns}")
 
 # COMMAND ----------
