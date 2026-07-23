@@ -9,7 +9,10 @@
 # MAGIC    (`selected_features.json`).
 # MAGIC 3. `first_order_propensity_hpo.py` — the distributed **HPO** run (`fop_hpo_champion` -> `best_params`).
 # MAGIC 4. **THIS notebook** — refit the champion on the frozen preprocessing, calibrate, assemble a
-# MAGIC    self-contained `pyfunc`, and **register it to Unity Catalog** with a signature + alias.
+# MAGIC    self-contained `pyfunc`, and **register it to Unity Catalog** with a signature + alias — logged via
+# MAGIC    `FeatureEngineeringClient.log_model(training_set=...)` so the point-in-time **feature lookups travel
+# MAGIC    INSIDE the model** and the batch scorer can call `fe.score_batch(df=<keys + feature_ts>)` with no
+# MAGIC    manual feature rebuild.
 # MAGIC
 # MAGIC ## What this notebook does (the 10-step contract)
 # MAGIC 1. **Consume upstream via REQUIRED widgets** — `hpo_champion_run_id` (-> `best_params`) and
@@ -32,8 +35,11 @@
 # MAGIC 6. **Assemble ONE `mlflow.pyfunc.PythonModel`** carrying the full chain: frozen preprocessing -> booster
 # MAGIC    -> optional calibrator, via the `artifacts=` dict.
 # MAGIC 7. **Infer the signature** with `infer_signature` + an `input_example` (mandatory for UC registration).
-# MAGIC 8. **Register to Unity Catalog** — `set_registry_uri('databricks-uc')`, three-level
-# MAGIC    `registered_model_name` (default `mlops_data_science.models.first_order_propensity`).
+# MAGIC 8. **Register to Unity Catalog via `fe.log_model`** — `set_registry_uri('databricks-uc')`,
+# MAGIC    `flavor=mlflow.pyfunc`, `training_set=<the create_training_set result>` (so the PIT `FeatureLookup`s are
+# MAGIC    packaged INTO the model for `fe.score_batch`), three-level `registered_model_name`
+# MAGIC    (default `mlops_data_science.models.first_order_propensity`). The frozen ENCODING stays inside the
+# MAGIC    pyfunc — only feature RETRIEVAL moves into the packaged lookups.
 # MAGIC 9. **Set the alias** — DEFAULT: `@champion` if the model has none yet, else `@challenger`. The
 # MAGIC    champion-promotion gate is documented below; a new version never auto-promotes over a live champion.
 # MAGIC 10. **One honest held-out TEST evaluation** (ROC-AUC, top-decile lift + capture, F2 at the VAL-chosen
@@ -46,15 +52,33 @@
 
 # MAGIC %md
 # MAGIC ## API grounding — what was verified against current docs
-# MAGIC The MLflow / UC surface below was grounded against the official docs (retrieved 2026-07-21):
+# MAGIC The Feature Engineering / MLflow / UC surface below was grounded against the official docs + canonical
+# MAGIC Databricks examples (retrieved 2026-07-23):
 # MAGIC
-# MAGIC * `mlflow.pyfunc.log_model(...)` — accepts `python_model`, `artifacts` (dict), `signature`,
-# MAGIC   `input_example`, `registered_model_name`, `pip_requirements`, `code_paths`. First positional is
-# MAGIC   `artifact_path` (deprecated in MLflow 3) with `name=` also accepted; this notebook uses `name=`.
-# MAGIC   Ref: `https://mlflow.org/docs/latest/api_reference/python_api/mlflow.pyfunc.html`
+# MAGIC * `FeatureEngineeringClient.log_model(model, artifact_path, *, flavor, training_set=None,`
+# MAGIC   `registered_model_name=None, await_registration_for=300, infer_input_example=False, **kwargs)` —
+# MAGIC   `model` "must be capable of being saved by `flavor.save_model`"; `flavor` is an MLflow module that
+# MAGIC   "must support the `python_function` flavor" (e.g. `mlflow.pyfunc`); `training_set` "captures feature
+# MAGIC   lineage" and is what makes `fe.score_batch` auto-join features at inference. Extra `**kwargs`
+# MAGIC   (`artifacts=`, `signature=`, `input_example=`, `pip_requirements=`/`conda_env=`) are forwarded to the
+# MAGIC   flavor's save. Ref: `https://api-docs.databricks.com/python/feature-engineering/latest/feature_engineering.client.html`
+# MAGIC   and the Databricks "train models with Feature Engineering" guide
+# MAGIC   (`https://docs.databricks.com/aws/en/machine-learning/feature-store/train-models-with-feature-store`).
+# MAGIC * **THE KEY UNCERTAINTY — RESOLVED: YES.** A custom `mlflow.pyfunc.PythonModel` that runs its OWN
+# MAGIC   preprocessing/encoding inside `predict` wraps cleanly under `fe.log_model(flavor=mlflow.pyfunc,`
+# MAGIC   `artifacts=..., training_set=...)`, and `fe.score_batch` performs the point-in-time lookup and passes
+# MAGIC   the **raw looked-up feature columns** into `predict` (where the frozen encoding then runs). Verified
+# MAGIC   against three examples with the identical shape to this model (custom PythonModel + `load_context` +
+# MAGIC   `context.artifacts[...]` + `fe.log_model(model=Wrapper(), flavor=mlflow.pyfunc, artifacts=...,`
+# MAGIC   `training_set=..., signature=..., input_example=...)`): the Databricks `databricks-ml-training` skill's
+# MAGIC   `feature-store.md`/`custom-pyfunc.md` references, the `alexmillerdb/mlops-workshop-demo` FS pyfunc
+# MAGIC   notebook, and the UC taxi Feature Engineering example (which also confirms non-lookup **passthrough**
+# MAGIC   columns in `df` reach the model). So the frozen segment one-hot stays IN the pyfunc; only feature
+# MAGIC   RETRIEVAL moves into the packaged `FeatureLookup`s. `segment` is NOT a store lookup (finding #1 — no
+# MAGIC   as-of column) and therefore travels as a passthrough column on the training-set `df`.
 # MAGIC * `mlflow.pyfunc.PythonModel` — `load_context(self, context)` and
 # MAGIC   `predict(self, context, model_input, params=None)`. Artifacts reachable via
-# MAGIC   `context.artifacts["<key>"]`. Same ref as above.
+# MAGIC   `context.artifacts["<key>"]`. Ref: `https://mlflow.org/docs/latest/api_reference/python_api/mlflow.pyfunc.html`
 # MAGIC * `mlflow.models.infer_signature(model_input, model_output)` — used with an `input_example`.
 # MAGIC * `MlflowClient.set_registered_model_alias(name, alias, version)` — verified parameter order.
 # MAGIC   Ref: `https://mlflow.org/docs/latest/api_reference/python_api/mlflow.client.html`
@@ -441,10 +465,15 @@ print(f"Spine rows        : {_n_spine:,}  (positives: {_n_pos:,} = {_n_pos / max
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## SECTION 2 — Point-in-time training set (SELECTED subset)
-# MAGIC `create_training_set` does the as-of join on the **selected** store features only, then `segment` is
-# MAGIC attached **current-state** (finding-#1 leakage caveat, preserved from HPO) and the v7 engagement gate is
-# MAGIC applied against the feature columns. Identical to HPO so the reproduced training frame matches.
+# MAGIC ## SECTION 2 — Point-in-time training set (SELECTED subset) + segment as a PASSTHROUGH column
+# MAGIC `create_training_set` does the as-of join on the **selected** store features only. `segment` is NOT a
+# MAGIC store lookup (finding #1 — no as-of column), so it is attached **current-state** to the spine `df`
+# MAGIC **before** `create_training_set` — making it a **passthrough source column** the training set records
+# MAGIC (exactly like a raw non-store feature in the UC taxi Feature Engineering example). This is what lets
+# MAGIC `fe.log_model(training_set=...)` package `segment` as a model input that `fe.score_batch` supplies at
+# MAGIC scoring time. The per-user segment values are identical to the old post-load join, so the reproduced
+# MAGIC training frame (and the frozen vocab fit on it) matches HPO byte-for-byte. The v7 engagement gate is
+# MAGIC still applied against the looked-up feature columns after `load_df()`.
 
 # COMMAND ----------
 
@@ -452,9 +481,27 @@ from databricks.feature_engineering import FeatureEngineeringClient, FeatureLook
 
 fe = FeatureEngineeringClient()
 
+# Attach `segment` CURRENT-STATE to the SPINE (before create_training_set) so it becomes a PASSTHROUGH source
+# column the training set records — the mechanism that lets fe.log_model package it as a model input and
+# fe.score_batch supply it at scoring time. Values are identical to the prior post-load join (same current-
+# state coalesce), so the reproduced training frame + frozen vocab are unchanged. segment stays a passthrough
+# (finding #1 — no as-of column), NOT a FeatureLookup; feature RETRIEVAL for store features moves to the
+# lookup below, encoding stays in the pyfunc.
+spine_for_training = spine_df
+if INCLUDE_SEGMENT:
+    # Reproduces v7's `coalesce(usm.segment_name, 'No Segment') AS segment`, joined current-state.
+    _segment_df = spark.sql(f"SELECT internal_user_id, segment_name FROM {USER_SEGMENT_MAPPING}")
+    spine_for_training = (
+        spine_df.join(_segment_df, on=ENTITY_KEY, how="left")
+        .withColumnRenamed("segment_name", "segment")
+        .fillna({"segment": "No Segment"})
+    )
+
 # Point-in-time lookup of the SELECTED store-resident subset (feature selection already done upstream).
+# segment (if included) rides along as a passthrough source column on `df`; it is NOT excluded, so it is
+# recorded as a model input the packaged model expects at score time.
 training_set = fe.create_training_set(
-    df=spine_df,
+    df=spine_for_training,
     feature_lookups=[
         FeatureLookup(
             table_name=FEATURE_TABLE,
@@ -464,7 +511,7 @@ training_set = fe.create_training_set(
         )
     ],
     label=LABEL,
-    exclude_columns=[FEATURE_TS],  # keep the join key out of the feature matrix
+    exclude_columns=[FEATURE_TS],  # keep the join key out of the feature matrix (segment is NOT excluded)
 )
 
 training_df = training_set.load_df()
@@ -472,17 +519,10 @@ print(f"PIT training columns ({len(training_df.columns)}): {training_df.columns}
 
 # COMMAND ----------
 
-# --- Attach `segment` CURRENT-STATE (finding-#1 caveat) + v7 engagement gate ----------
+# --- v7 engagement gate (segment already attached as a passthrough on the training-set df above) ------
+# `segment` was joined current-state onto the spine BEFORE create_training_set (SECTION 2, so it is packaged
+# as a model input), and load_df() already carries it — no post-load segment join is needed here.
 analysis_df = training_df
-
-if INCLUDE_SEGMENT:
-    # Reproduces v7's `coalesce(usm.segment_name, 'No Segment') AS segment`, joined current-state.
-    segment_df = spark.sql(f"SELECT internal_user_id, segment_name FROM {USER_SEGMENT_MAPPING}")
-    analysis_df = (
-        analysis_df.join(segment_df, on=ENTITY_KEY, how="left")
-        .withColumnRenamed("segment_name", "segment")
-        .fillna({"segment": "No Segment"})
-    )
 
 # v7's engagement gate, applied AGAINST THE FEATURE TABLE columns (only the recency columns that were
 # actually selected). NULL recency == "never", so IS NOT NULL reproduces v7's *_search IS NOT NULL, and
@@ -1149,9 +1189,19 @@ with mlflow.start_run(run_name="fop_model_registration") as run:
         "test_brier_served": test_brier_served,
     })
 
-    model_info = mlflow.pyfunc.log_model(
-        name="model",                                   # MLflow 3 idiom (artifact_path= is the 2.x equivalent)
-        python_model=FirstOrderPropensityModel(),
+    # Log via the Feature Engineering client so the point-in-time FeatureLookups (from `training_set`) are
+    # PACKAGED INTO the model. flavor=mlflow.pyfunc keeps the frozen-encoding pyfunc as the wrapped model:
+    # fe.score_batch will do the as-of lookup and pass the RAW looked-up feature columns into predict(), where
+    # the frozen segment one-hot then runs. `segment` rides in via the training-set's passthrough column.
+    # artifacts / signature / input_example / pip_requirements forward through **kwargs to the pyfunc save
+    # (same forwarding path dbdemos/mlops-workshop use for signature/input_example/conda_env/artifacts).
+    # fe.log_model uses `artifact_path=` (not MLflow-3 `name=`); its return value is not relied on — the
+    # registered version is resolved by run_id match below, and the round-trip URI is built from run_id.
+    fe.log_model(
+        model=FirstOrderPropensityModel(),
+        artifact_path="model",
+        flavor=mlflow.pyfunc,
+        training_set=training_set,                       # packages the PIT FeatureLookups into the model
         artifacts=MODEL_ARTIFACTS,
         signature=signature,
         input_example=input_example,
@@ -1159,7 +1209,8 @@ with mlflow.start_run(run_name="fop_model_registration") as run:
         pip_requirements=PIP_REQUIREMENTS,
     )
     run_id = run.info.run_id
-    print(f"Logged + registered pyfunc in run {run_id}")
+    _model_uri = f"runs:/{run_id}/model"                 # artifact_path='model' -> deterministic run-relative URI
+    print(f"Logged + registered feature-packaged pyfunc in run {run_id}")
 
 registered_version = _resolve_registered_version(_uc_client, REGISTERED_MODEL_NAME, run_id)
 print(f"Registered {REGISTERED_MODEL_NAME} version {registered_version}")
@@ -1168,8 +1219,13 @@ print(f"Registered {REGISTERED_MODEL_NAME} version {registered_version}")
 
 # --- Best-effort round-trip check: load the logged model back and predict on the input_example --------
 # Proves the whole chain (frozen preprocessing -> booster -> calibrator) survives log/load. Live-only.
+# TODO(verify-api): confirm on a live workspace that mlflow.pyfunc.load_model on an fe.log_model-packaged
+# model returns the raw wrapped pyfunc and runs predict() on raw feature columns (no auto feature lookup at
+# plain-pyfunc load — the lookup is fe.score_batch's job). This is the observed pattern in the UC taxi FE
+# example, but it was not directly confirmable in the API docs. The check is guarded (never fails the run);
+# fe.score_batch (the scorer's confirmed path) is what packages + resolves the feature lookups.
 try:
-    _loaded = mlflow.pyfunc.load_model(model_info.model_uri)
+    _loaded = mlflow.pyfunc.load_model(_model_uri)
     _rt = _loaded.predict(input_example)
     assert list(_rt.columns) == ["raw_score", "calibrated_probability", "decile"], _rt.columns
     print(f"Round-trip OK — loaded model returned columns {list(_rt.columns)} for {_rt.shape[0]} rows.")

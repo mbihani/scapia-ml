@@ -12,30 +12,31 @@
 # MAGIC    output table for downstream activation.
 # MAGIC
 # MAGIC ## The single most important correctness decision — matches how the model was LOGGED
-# MAGIC The training notebook logged the champion as a **plain `mlflow.pyfunc` model**
-# MAGIC (`mlflow.pyfunc.log_model(...)`, SECTION 8) — **not** with `FeatureEngineeringClient.log_model(...)`.
-# MAGIC It does *not* carry feature metadata / a feature_spec, so `fe.score_batch(...)` is **not** applicable
-# MAGIC (that API requires a model logged via `fe.log_model`). Instead, training built its matrix by an explicit
-# MAGIC point-in-time `fe.create_training_set(...)` join and then passed the resulting **raw feature columns**
-# MAGIC into the pyfunc. So this scorer **mirrors that exact path**:
+# MAGIC The training notebook now logs the champion via **`FeatureEngineeringClient.log_model(training_set=...)`**
+# MAGIC (SECTION 8), so the point-in-time **`FeatureLookup`s are packaged INTO the model**. That makes
+# MAGIC `fe.score_batch(...)` the correct — and far simpler — scoring path: it performs the as-of feature lookup
+# MAGIC automatically from the packaged lineage and passes the **raw looked-up feature columns** straight into the
+# MAGIC pyfunc's `predict`, where the frozen preprocessing runs. So this scorer:
 # MAGIC
-# MAGIC * rebuild the scoring feature matrix with the SAME `fe.create_training_set(...)` as-of join
-# MAGIC   (`label=None`, since inference has no label),
-# MAGIC * feed the model the **same raw input columns** its signature declares,
-# MAGIC * call `model.predict` (distributed via `mlflow.pyfunc.spark_udf`).
+# MAGIC * builds ONLY a **scoring spine** (`internal_user_id`, `feature_ts`, + the current-state `segment`
+# MAGIC   passthrough the model expects) — **no** `create_training_set` / `spark_udf` feature rebuild,
+# MAGIC * calls `fe.score_batch(model_uri=<@champion>, df=<spine>)` and lets Feature Engineering do the PIT join,
+# MAGIC * reads the model's own multi-column output (`raw_score`, `calibrated_probability`, `decile`).
 # MAGIC
 # MAGIC The pyfunc carries the **frozen preprocessing** (segment vocab, decile score edges, booster,
-# MAGIC calibrator). We therefore do **no** `fit` / `value_counts` / `get_dummies` here — the model's own
-# MAGIC `predict` runs the frozen transform, so train/serve feature construction is identical *by construction*.
+# MAGIC calibrator), so we do **no** `fit` / `value_counts` / `get_dummies` / feature retrieval here — the model's
+# MAGIC own `predict` runs the frozen transform on the FE-supplied columns, so train/serve feature construction
+# MAGIC (retrieval AND encoding) is identical *by construction*.
 # MAGIC
 # MAGIC ## Scoring contract implemented here
 # MAGIC 1. Load the champion by **ALIAS only** (`models:/mlops_data_science.models.first_order_propensity@champion`) —
 # MAGIC    never a hard-coded version. Resolve the concrete version + run_id from the alias; **fail loud** if it
 # MAGIC    does not resolve.
-# MAGIC 2. Build the **scoring population** by reusing the spine eligibility logic — carded-before-cutoff +
+# MAGIC 2. Build the **scoring spine** by reusing the spine eligibility logic — carded-before-cutoff +
 # MAGIC    first-order anti-join — but with **NO label and NO forward performance window** (inference only).
 # MAGIC    `spark.sql` only: no `databricks-sql-connector`, no PAT, no egress.
-# MAGIC 3. **Point-in-time** feature construction as-of the scoring date (identical to training's `create_training_set`).
+# MAGIC 3. **`fe.score_batch`** does the point-in-time feature lookup as-of `feature_ts` (from the packaged
+# MAGIC    `FeatureLookup`s) and scores — no manual feature matrix.
 # MAGIC 4. Emit **score + decile** per user. The decile uses the **frozen VAL score edges carried inside the
 # MAGIC    model** (population-anchored, computed at training) — see Section 4 — so deciles are comparable across
 # MAGIC    scoring runs and independent of this batch's size.
@@ -50,35 +51,42 @@
 
 # MAGIC %md
 # MAGIC ## API grounding — what was verified against current docs
-# MAGIC Grounded against the official docs (retrieved 2026-07-21):
+# MAGIC Grounded against the official docs + canonical Databricks examples (retrieved 2026-07-23):
 # MAGIC
-# MAGIC * `FeatureEngineeringClient.create_training_set(df, feature_lookups, label=None, exclude_columns, ...)`
-# MAGIC   — `label` **may be `None`** ("To create a training set without a label field, i.e. for unsupervised
-# MAGIC   training set, specify `label = None`."). The returned `TrainingSet` has `.load_df()`.
+# MAGIC * `FeatureEngineeringClient.score_batch(model_uri, df, result_type='double', env_manager='local',`
+# MAGIC   `params=None, ...)` — scores a model logged with `fe.log_model` (our champion now is). The input `df`
+# MAGIC   must "(1) contain columns for lookup keys required to join feature data from feature tables, (2) contain
+# MAGIC   columns for all source keys required to score the model, (3) not contain a column `prediction`". For a
+# MAGIC   **time-series** feature table the `df` "must contain a timestamp column with the same name and DataType
+# MAGIC   as the `timestamp_lookup_key`" — here that is `feature_ts`. Feature Engineering **auto-joins** the
+# MAGIC   feature values (do NOT pre-join them). The returned DataFrame is: all columns of `df` + all looked-up
+# MAGIC   feature values + **a column `prediction`** holding the model output. `result_type` accepts a Spark type
+# MAGIC   / **DDL struct string** for a multi-column pyfunc output (verified: taxi example uses `fe.score_batch`
+# MAGIC   for a pyfunc; `surrogate_modeling` uses `result_type=ArrayType(DoubleType())` for multi-value output),
+# MAGIC   so `prediction` becomes a struct we unpack. `env_manager="local"` scores in the current cluster
+# MAGIC   environment (no env rebuild — required here since the box has no PyPI egress).
 # MAGIC   Ref: `https://api-docs.databricks.com/python/feature-engineering/latest/feature_engineering.client.html`
-# MAGIC * `FeatureEngineeringClient.score_batch(...)` — **requires** a model logged with `fe.log_model` (feature
-# MAGIC   metadata). Our champion is a plain pyfunc, so this scorer does **not** use `score_batch`. Same ref.
-# MAGIC * `mlflow.pyfunc.spark_udf(spark, model_uri, result_type=None, env_manager=None, ...)` — `result_type`
-# MAGIC   accepts a **DDL struct string** for multi-column model output; `env_manager="local"` scores in the
-# MAGIC   current cluster environment (no env rebuild — required here since the box has no PyPI egress). When the
-# MAGIC   model has a signature, the eval DataFrame's column names must match the signature.
-# MAGIC   Ref: `https://mlflow.org/docs/latest/api_reference/python_api/mlflow.pyfunc.html`
+# MAGIC   and the Databricks "model inference with Feature Engineering" / UC taxi Feature Engineering example.
+# MAGIC * **Passthrough (non-lookup) columns**: columns present in `df` that are not in any feature table are
+# MAGIC   passed to `predict` unchanged (UC taxi example: raw `trip_distance`). This is how current-state
+# MAGIC   `segment` (finding #1 — no as-of column) reaches the model, exactly as it did at training time.
 # MAGIC * `MlflowClient(registry_uri="databricks-uc").get_model_version_by_alias(name, alias)` — resolves the
 # MAGIC   `@champion` alias to a concrete `ModelVersion` (`.version`, `.run_id`). Raises `RESOURCE_DOES_NOT_EXIST`
 # MAGIC   when the alias is absent — we surface that as a fail-loud error.
 # MAGIC   Ref: `https://mlflow.org/docs/latest/api_reference/python_api/mlflow.client.html`
-# MAGIC * `PyFuncModel.metadata.signature.inputs` (a `Schema`, with `.input_names()`) — the serve-time contract
-# MAGIC   for the exact raw input columns. Same pyfunc ref.
+# MAGIC * `include_segment` / the store-feature subset are read back from the champion's **training run params**
+# MAGIC   (logged in SECTION 8 of the training notebook) rather than re-derived, so the scorer's spine matches
+# MAGIC   what the model was trained + packaged with — no hardcoded feature list.
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## 0. Dependencies
 # MAGIC MLflow 3.0, XGBoost, scikit-learn and `databricks-feature-engineering` all ship with Databricks Runtime
-# MAGIC 17.0 ML+. The install below pins recent versions so `create_training_set` (PIT join), `spark_udf` and the
-# MAGIC pyfunc's own imports (XGBoost booster + sklearn calibrator, invoked inside `predict`) are all available on
-# MAGIC every node. Notebook-scoped `%pip` propagates to executors, which `spark_udf(env_manager="local")` needs.
-# MAGIC Safe to skip on a current ML Runtime.
+# MAGIC 17.0 ML+. The install below pins recent versions so `fe.score_batch` (PIT join + distributed scoring) and
+# MAGIC the pyfunc's own imports (XGBoost booster + sklearn calibrator, invoked inside `predict`) are all available
+# MAGIC on every node. Notebook-scoped `%pip` propagates to executors, which `score_batch(env_manager="local")`
+# MAGIC needs. Safe to skip on a current ML Runtime.
 
 # COMMAND ----------
 
@@ -132,12 +140,15 @@ QUALIFYING_PRODUCT_CATEGORIES = [
 # The one supported current-state (non-store) feature, matching the sibling notebooks.
 SUPPORTED_NON_STORE_FEATURES = ["segment"]
 
-# spark_udf environment manager. "local" uses the current cluster env (fast, no PyPI egress needed — this box
-# blackholes PyPI). Switch to "virtualenv" ONLY on a cluster with egress if you want the model's pinned env.
-SPARK_UDF_ENV_MANAGER = "local"
+# score_batch environment manager. "local" uses the current cluster env (fast, no PyPI egress needed — this
+# box blackholes PyPI). Switch to "virtualenv" ONLY on a cluster with egress if you want the model's pinned env.
+SCORE_BATCH_ENV_MANAGER = "local"
 
-# The pyfunc's fixed output columns (asserted after load so a model-contract change fails loud, not silent).
+# The pyfunc's fixed output columns, in order. score_batch returns them inside its `prediction` struct; this
+# DDL is the result_type we pass, and the field order/names are asserted below so a model-contract change
+# fails loud, not silent. `decile` is bigint to match the pyfunc's int64 output.
 EXPECTED_MODEL_OUTPUT_COLS = ["raw_score", "calibrated_probability", "decile"]
+SCORE_RESULT_DDL = "raw_score double, calibrated_probability double, decile bigint"
 
 # ---------------------------------------------------------------------------
 
@@ -208,11 +219,13 @@ print(f"Output table  : {OUTPUT_TABLE}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## SECTION 1 — Resolve + load the champion (ALIAS ONLY)
-# MAGIC The alias is resolved to a concrete version + run_id for the provenance columns, then the pyfunc is
-# MAGIC loaded. **Fail loud** if the `@champion` alias does not resolve — we never fall back to a version. The
-# MAGIC model's input **signature** gives the exact raw feature columns to build; its output columns are asserted
-# MAGIC against the known contract so a silent model-shape change is caught here rather than corrupting the write.
+# MAGIC ## SECTION 1 — Resolve the champion (ALIAS ONLY)
+# MAGIC The alias is resolved to a concrete version + run_id for the provenance columns. **Fail loud** if the
+# MAGIC `@champion` alias does not resolve — we never fall back to a version. We do **not** load the pyfunc or
+# MAGIC build a feature matrix here: `fe.score_batch` (Section 4) loads the model by URI and auto-joins the
+# MAGIC packaged features. `include_segment` is read back from the champion's **training run params** (logged in
+# MAGIC the training notebook's SECTION 8) so we know whether to attach the current-state `segment` passthrough
+# MAGIC the model expects — deterministic, not re-derived from a feature list.
 
 # COMMAND ----------
 
@@ -241,36 +254,26 @@ def resolve_champion(client, model_name, alias):
 CHAMPION_VERSION, CHAMPION_RUN_ID = resolve_champion(_uc_client, REGISTERED_MODEL_NAME, MODEL_ALIAS)
 print(f"Resolved @{MODEL_ALIAS} -> version {CHAMPION_VERSION} (run_id {CHAMPION_RUN_ID or 'unknown'})")
 
-# Load the pyfunc BY ALIAS (not by the resolved version) so scoring always tracks the promoted champion.
-loaded_model = mlflow.pyfunc.load_model(MODEL_URI)
+# Whether the model uses current-state `segment` is read back from the champion's TRAINING run params
+# (logged as `include_segment` in the training notebook's SECTION 8). We do NOT load the pyfunc or inspect a
+# feature list here: fe.score_batch (Section 4) auto-joins the packaged store features, and segment is the
+# only passthrough column the scorer must supply on the spine. Default False (segment not attached) if the
+# param is absent — the model simply would not have been packaged with a segment input in that case.
+def _resolve_include_segment(client, run_id):
+    """Read `include_segment` from the champion's training run params. Returns bool; defaults False if absent."""
+    if not run_id:
+        print("WARNING: champion has no run_id; cannot read include_segment from training params -> False.")
+        return False
+    try:
+        raw = client.get_run(run_id).data.params.get("include_segment")
+    except Exception as exc:  # noqa: BLE001 — a missing/unreadable run should not silently attach segment
+        print(f"WARNING: could not read training run {run_id} params ({exc}); include_segment -> False.")
+        return False
+    return str(raw).strip().lower() == "true"
 
-# The raw input columns the model expects == its input signature. This is the serve-time contract; the
-# store-resident subset + optional current-state `segment` are derived from it (no hardcoded feature list).
-_sig = getattr(loaded_model.metadata, "signature", None)
-if _sig is None or _sig.inputs is None:
-    raise ValueError(
-        "Champion model has no input signature — cannot determine the raw scoring feature columns. A signature "
-        "is mandatory for UC registration, so this indicates a malformed model. FAILING FAST."
-    )
-INPUT_COLS = list(_sig.inputs.input_names())
-if not INPUT_COLS:
-    raise ValueError("Champion input signature has no named columns; cannot map scoring features. FAILING FAST.")
 
-STORE_FEATURES = [c for c in INPUT_COLS if c not in SUPPORTED_NON_STORE_FEATURES]  # PIT-lookupable subset
-INCLUDE_SEGMENT = "segment" in INPUT_COLS  # DERIVED from the signature, not hardcoded
-
-# Assert the output contract (raw_score, calibrated_probability, decile) so a shape change fails loud here.
-_out = getattr(loaded_model.metadata, "signature", None)
-_out_names = list(_out.outputs.input_names()) if (_out is not None and _out.outputs is not None) else []
-if _out_names and _out_names != EXPECTED_MODEL_OUTPUT_COLS:
-    raise ValueError(
-        f"Champion output columns {_out_names} != expected {EXPECTED_MODEL_OUTPUT_COLS}. The scorer's decile / "
-        f"score extraction assumes that contract. Refusing to write against an unknown output shape. FAILING FAST."
-    )
-
-print(f"Model input columns ({len(INPUT_COLS)}): {INPUT_COLS}")
-print(f"  store-resident (PIT lookup): {STORE_FEATURES}")
-print(f"  include segment (current-state): {INCLUDE_SEGMENT}")
+INCLUDE_SEGMENT = _resolve_include_segment(MlflowClient(), CHAMPION_RUN_ID)  # tracking client reads run params
+print(f"  include segment (current-state passthrough): {INCLUDE_SEGMENT}")
 
 # COMMAND ----------
 
@@ -380,7 +383,7 @@ SCORING_CUTOFF_TS = resolve_scoring_date(dbutils.widgets.get("scoring_date"))
 SCORING_DATE_STR = _parse_ts(SCORING_CUTOFF_TS).strftime("%Y-%m-%d")  # DATE partition / idempotency key
 
 population_df = spark.sql(build_scoring_population_sql(SCORING_CUTOFF_TS, IST_OFFSET_MINUTES))
-population_df = population_df.cache()  # count + create_training_set both consume it
+population_df = population_df.cache()  # count + score_batch spine both consume it
 _n_population = population_df.count()
 print(f"scoring cutoff / feature_ts : {SCORING_CUTOFF_TS}")
 print(f"scoring_date (partition key): {SCORING_DATE_STR}")
@@ -394,124 +397,113 @@ if _n_population == 0:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## SECTION 3 — Point-in-time feature matrix (identical to training's `create_training_set`)
-# MAGIC `create_training_set` does the as-of join on exactly the champion's **store-resident** feature subset
-# MAGIC (derived from the signature in Section 1), with `label=None` (inference). Then `segment` is attached
-# MAGIC **current-state** IF the model uses it, and the v7 engagement gate is applied against whichever recency
-# MAGIC columns the model actually uses — mirroring training's SECTION 2 so the scored population matches the
-# MAGIC trained one. No encoding happens here: the pyfunc carries the frozen preprocessing.
+# MAGIC ## SECTION 3 — Scoring spine (keys + feature_ts + segment passthrough) — NO manual feature build
+# MAGIC Because the champion is packaged with its `FeatureLookup`s, we do **not** rebuild the feature matrix.
+# MAGIC The spine that `fe.score_batch` consumes needs only:
+# MAGIC
+# MAGIC * `internal_user_id` — the lookup key,
+# MAGIC * `feature_ts` — the timeseries key (same name + type as the packaged `timestamp_lookup_key`), which
+# MAGIC   drives the as-of join to the latest `feature_ts <= cutoff`,
+# MAGIC * `segment` — attached **current-state** IF the model was trained with it (a **passthrough** column, not
+# MAGIC   a lookup: finding #1, no as-of table), exactly as training attached it to its training-set spine.
+# MAGIC
+# MAGIC The store features are looked up automatically by `score_batch` (Section 4) — no `create_training_set`,
+# MAGIC no `spark_udf`, no `feature_names` list here. The v7 engagement gate needs the looked-up recency columns,
+# MAGIC which only exist AFTER the auto-join, so it is applied to the `score_batch` OUTPUT in Section 4 (scoring
+# MAGIC is per-row, so gating after scoring drops exactly the same users as gating before — identical result).
 
 # COMMAND ----------
 
-from databricks.feature_engineering import FeatureEngineeringClient, FeatureLookup
+from databricks.feature_engineering import FeatureEngineeringClient
 
 fe = FeatureEngineeringClient()
 
-# Point-in-time lookup of the champion's store-resident subset. label=None -> inference/scoring set.
-scoring_set = fe.create_training_set(
-    df=population_df,
-    feature_lookups=[
-        FeatureLookup(
-            table_name=FEATURE_TABLE,
-            lookup_key=ENTITY_KEY,
-            timestamp_lookup_key=FEATURE_TS,  # as-of join -> latest feature_ts <= cutoff (no future leakage)
-            feature_names=STORE_FEATURES,
-        )
-    ],
-    label=None,                       # NO label at scoring time (unsupervised training set)
-    exclude_columns=[FEATURE_TS],     # keep the join key out of the feature matrix (as training did)
-)
-
-scoring_features_df = scoring_set.load_df()
-print(f"PIT scoring columns ({len(scoring_features_df.columns)}): {scoring_features_df.columns}")
-
-# COMMAND ----------
-
-# --- Attach `segment` CURRENT-STATE (only if the champion uses it) + v7 engagement gate --------------
-scoring_df = scoring_features_df
-
+# Build the score_batch spine: keys + feature_ts, plus the current-state `segment` passthrough IF the model
+# uses it. NO FeatureLookup / create_training_set — score_batch auto-joins the packaged store features.
+score_spine = population_df
 if INCLUDE_SEGMENT:
-    # Reproduces v7's `coalesce(usm.segment_name, 'No Segment') AS segment`, joined current-state.
+    # Reproduces v7's `coalesce(usm.segment_name, 'No Segment') AS segment`, joined current-state — the same
+    # passthrough column the training-set spine carried, so the model receives segment exactly as at training.
     segment_df = spark.sql(f"SELECT internal_user_id, segment_name FROM {USER_SEGMENT_MAPPING}")
-    scoring_df = (
-        scoring_df.join(segment_df, on=ENTITY_KEY, how="left")
+    score_spine = (
+        score_spine.join(segment_df, on=ENTITY_KEY, how="left")
         .withColumnRenamed("segment_name", "segment")
         .fillna({"segment": SEGMENT_DEFAULT})
     )
-
-# v7's engagement gate, applied AGAINST THE FEATURE TABLE columns the model actually uses (guarded on
-# presence exactly like training's SECTION 2). NULL recency == "never", so IS NOT NULL reproduces v7's
-# *_search IS NOT NULL, and days_since_last_app_open < 90 reproduces v7's coalesce(...,9999) < 90.
-_gate_terms = []
-if "days_since_last_app_open" in scoring_df.columns:
-    _gate_terms.append("days_since_last_app_open < 90")
-for _rc in [
-    "days_since_last_flight_search", "days_since_last_hotel_search",
-    "days_since_last_bus_search", "days_since_last_train_search",
-]:
-    if _rc in scoring_df.columns:
-        _gate_terms.append(f"{_rc} IS NOT NULL")
-if _gate_terms:
-    scoring_df = scoring_df.filter(" OR ".join(_gate_terms))
-    print(f"Applied v7 engagement gate on the model's recency columns: {_gate_terms}")
-else:
-    print("No recency/app-open columns in the model's feature subset -> engagement gate skipped (documented "
-          "divergence, matching training when those columns are not selected).")
-
-scoring_df = scoring_df.cache()
-_n_scoring = scoring_df.count()
-print(f"Scoring feature set ready: {_n_scoring:,} rows, feeding model columns {INPUT_COLS}")
-if _n_scoring == 0:
-    raise ValueError("Scoring feature set is empty after the engagement gate. Refusing to write. FAILING FAST.")
+print(f"Score_batch spine columns: {score_spine.columns}")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## SECTION 4 — Score (distributed) with the champion pyfunc
-# MAGIC Scoring runs **distributed** via `mlflow.pyfunc.spark_udf` (the eligible population can be large; this
-# MAGIC avoids pulling it to the driver). The UDF is fed the model's raw input columns; numerics are cast to
-# MAGIC `double` to match the training-time signature (recency columns legitimately carry NULL). We do **no**
-# MAGIC preprocessing here — the pyfunc's frozen transform runs inside `predict`.
+# MAGIC ## SECTION 4 — Score with `fe.score_batch` (auto PIT feature lookup) + v7 engagement gate
+# MAGIC `fe.score_batch` loads the champion by URI, performs the **point-in-time feature lookup** from the
+# MAGIC packaged `FeatureLookup`s (as-of `feature_ts`), and passes the raw looked-up columns into the pyfunc's
+# MAGIC `predict` — where the frozen preprocessing runs. It returns all spine columns + the looked-up feature
+# MAGIC values + a `prediction` column (here a struct, from our `result_type` DDL). We do **no** preprocessing.
 # MAGIC
-# MAGIC **Decile rule (documented, reproducible):** we use the model's **own `decile` output**, which is computed
-# MAGIC from the **frozen VAL score edges captured at training** (`decile_score_edges` inside the model). These
-# MAGIC are FIXED edges carried from training, so a user's decile is population-anchored and identical regardless
-# MAGIC of how many users are in *this* scoring batch — the correct choice for an operational score meant to be
-# MAGIC compared across runs. (We deliberately do NOT recompute a rank-based decile on the scoring batch, which
-# MAGIC would drift with batch composition.) `model_score` is the calibrated probability; `raw_score` is the
-# MAGIC monotonic ranking score the decile derives from, kept for lineage.
+# MAGIC The v7 engagement gate is applied to the returned looked-up recency columns (guarded on presence exactly
+# MAGIC like training's SECTION 2). NULL recency == "never", so `IS NOT NULL` reproduces v7's `*_search IS NOT
+# MAGIC NULL`, and `days_since_last_app_open < 90` reproduces v7's `coalesce(...,9999) < 90`. Because scoring is
+# MAGIC per-row and independent, gating the scored output drops exactly the users a pre-scoring gate would.
+# MAGIC
+# MAGIC **Decile rule (documented, reproducible):** we use the model's **own `decile` output**, computed from the
+# MAGIC **frozen VAL score edges captured at training** (`decile_score_edges` inside the model). These FIXED edges
+# MAGIC make a user's decile population-anchored and identical regardless of this batch's size — the correct
+# MAGIC choice for an operational score compared across runs. `model_score` is the calibrated probability;
+# MAGIC `raw_score` is the monotonic ranking score the decile derives from, kept for lineage.
 
 # COMMAND ----------
 
 from pyspark.sql import functions as F
 
-# Cast numerics to double (match the signature) and keep segment as string; select exactly the input columns.
-_cast_cols = []
-for _c in INPUT_COLS:
-    if _c in SUPPORTED_NON_STORE_FEATURES:
-        _cast_cols.append(F.col(_c).cast("string").alias(_c))
-    else:
-        _cast_cols.append(F.col(_c).cast("double").alias(_c))
-scoring_casted = scoring_df.select(F.col(ENTITY_KEY), *_cast_cols)
-
-# Multi-output pyfunc -> DDL struct result_type. env_manager="local" uses the cluster env (no PyPI egress).
-_RESULT_DDL = "raw_score double, calibrated_probability double, decile bigint"
-score_udf = mlflow.pyfunc.spark_udf(
-    spark,
+# score_batch: PIT-joins the packaged store features as-of feature_ts and scores. Multi-output pyfunc ->
+# DDL struct result_type so `prediction` is a struct we unpack. env_manager="local" uses the cluster env
+# (no PyPI egress). df carries ONLY the lookup key + timeseries key + segment passthrough.
+scored_raw = fe.score_batch(
     model_uri=MODEL_URI,                 # ALIAS ONLY — scores with the promoted champion
-    result_type=_RESULT_DDL,
-    env_manager=SPARK_UDF_ENV_MANAGER,
+    df=score_spine,
+    result_type=SCORE_RESULT_DDL,
+    env_manager=SCORE_BATCH_ENV_MANAGER,
 )
 
-# Pass columns in signature order; the model's predict returns raw_score / calibrated_probability / decile.
-scored = scoring_casted.withColumn("_pred", score_udf(*[F.col(c) for c in INPUT_COLS]))
-scored = scored.select(
+# v7 engagement gate on the looked-up recency columns score_batch just joined in (guarded on presence).
+_gate_terms = []
+if "days_since_last_app_open" in scored_raw.columns:
+    _gate_terms.append("days_since_last_app_open < 90")
+for _rc in [
+    "days_since_last_flight_search", "days_since_last_hotel_search",
+    "days_since_last_bus_search", "days_since_last_train_search",
+]:
+    if _rc in scored_raw.columns:
+        _gate_terms.append(f"{_rc} IS NOT NULL")
+if _gate_terms:
+    scored_raw = scored_raw.filter(" OR ".join(_gate_terms))
+    print(f"Applied v7 engagement gate on the model's recency columns: {_gate_terms}")
+else:
+    print("No recency/app-open columns in the model's feature subset -> engagement gate skipped (documented "
+          "divergence, matching training when those columns are not selected).")
+
+# Unpack the `prediction` struct into the fixed output contract (raw_score, calibrated_probability, decile).
+# Assert the struct fields match EXPECTED_MODEL_OUTPUT_COLS so a silent model-shape change fails loud here.
+_pred_field = scored_raw.schema["prediction"]
+_pred_fields = [f.name for f in _pred_field.dataType.fields]
+if _pred_fields != EXPECTED_MODEL_OUTPUT_COLS:
+    raise ValueError(
+        f"score_batch prediction fields {_pred_fields} != expected {EXPECTED_MODEL_OUTPUT_COLS}. The scorer's "
+        f"decile / score extraction assumes that contract. Refusing to write against an unknown output shape. "
+        f"FAILING FAST."
+    )
+scored = scored_raw.select(
     F.col(ENTITY_KEY),
-    F.col("_pred.raw_score").alias("raw_score"),
-    F.col("_pred.calibrated_probability").alias("calibrated_probability"),
-    F.col("_pred.decile").alias("decile"),
+    F.col("prediction.raw_score").alias("raw_score"),
+    F.col("prediction.calibrated_probability").alias("calibrated_probability"),
+    F.col("prediction.decile").alias("decile"),
 )
-print("Scoring UDF wired (distributed). Columns:", scored.columns)
+scored = scored.cache()
+_n_scoring = scored.count()
+print(f"Scored population: {_n_scoring:,} rows. Output columns: {scored.columns}")
+if _n_scoring == 0:
+    raise ValueError("Scored set is empty after the engagement gate. Refusing to write. FAILING FAST.")
 
 # COMMAND ----------
 
@@ -589,7 +581,6 @@ try:
             "scoring_date": SCORING_DATE_STR,
             "scoring_cutoff_ts": SCORING_CUTOFF_TS,
             "include_segment": INCLUDE_SEGMENT,
-            "n_input_features": len(INPUT_COLS),
         })
         mlflow.log_metrics({
             "eligible_population": float(_n_population),
