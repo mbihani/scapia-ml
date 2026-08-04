@@ -144,8 +144,19 @@ if not spark.catalog.tableExists(GOLD_TABLE):
 # computed. last_call_datetime is a UTC instant; compared under a UTC session so both sides agree.
 cutoff = F.current_timestamp() - F.expr(f"INTERVAL {ACTIVE_TICKET_WINDOW_HOURS} HOURS")
 active = spark.table(GOLD_TABLE).filter(F.col("last_call_datetime") >= cutoff)
+
+# Defense-in-depth (BLOCKING-3): never score an ALREADY-ESCALATED ticket. 03_gold_features (mode=inference)
+# already emits no record for is_escalated=1, but gold is a shared table that could have last been written in
+# training mode — so we also filter here. Guarded for when the column is absent.
+if "is_escalated" in active.columns:
+    _before_esc = active.count()
+    active = active.filter((F.col("is_escalated").isNull()) | (F.col("is_escalated") == 0))
+    _dropped = _before_esc - active.count()
+    if _dropped:
+        print(f"excluded {_dropped:,} already-escalated tickets from scoring (BLOCKING-3).")
+
 _n_active = active.count()
-print(f"active tickets (last call within {ACTIVE_TICKET_WINDOW_HOURS}h, UTC): {_n_active:,}")
+print(f"active tickets (last call within {ACTIVE_TICKET_WINDOW_HOURS}h, UTC, not-yet-escalated): {_n_active:,}")
 
 # COMMAND ----------
 

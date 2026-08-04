@@ -90,7 +90,10 @@ and upserts `ticket_escalation_predictions`.
 
 - **Pre-escalation slicing.** Features are built from calls strictly *before* the first escalation so the model
   learns leading indicators, not the escalation itself. First-call-escalation tickets are dropped (no
-  pre-window). *(spec + reference)*
+  pre-window). *(spec + reference)* **Already-escalated tickets are scored only in training, never at
+  inference** — once the escalating alert has fired the outcome has happened, so scoring it is meaningless and
+  would pollute the CX queue; `build_ticket_feature_record(training=False)` returns no record for them, and
+  `06` additionally filters `is_escalated=1` as defense-in-depth.
 - **Worst-of aggregation.** GL sentiment/quality is summarised by its most-negative call (`bad < neutral <
   good`) — one bad call is the signal, not the average.
 - **K-Fold target encoding — OOF for training, full maps for serving (no leakage).** High-cardinality
@@ -105,11 +108,17 @@ and upserts `ticket_escalation_predictions`.
   identical partition regardless of Spark row order, and no ticket's rows straddle splits. The pre-escalation
   slice sorts by `(call_datetime, call_id)` so tied timestamps order reproducibly. All time math is on **UTC
   instants** (session tz pinned to UTC; IST kept only for display).
-- **True per-call key.** `call_id = SHA256(transcript)` (as in the reference) is the silver **dedup key** — so
-  two genuinely distinct calls sharing a timestamp are never collapsed — and the deterministic tie-break sort
-  key. **Transcript handling:** the Greylabs feed carries a `Transcript` column (bronze), so silver
-  **quarantines rows with a null/empty transcript** (logged with a count) *before* dropping the transcript
-  text. If a future export lacks `Transcript`, repoint `CALL_ID_SOURCE` to another per-call unique column.
+- **Per-call key = per-ticket-scoped composite hash.** The Greylabs export has **no native call-ID column**
+  (confirmed against the raw export; the reference notebook's `Call_Id` was itself a derived `SHA256(Transcript)`
+  it then dropped). `SHA256(transcript)` *alone* collides across tickets whenever transcript text repeats
+  (short/templated/IVR fragments) and loses data, so `call_id = SHA256(ticket_id || call_datetime ||
+  transcript)` — identity is scoped to a ticket and can't collide across tickets. It's the silver **dedup key**
+  and the deterministic **total-order tie-break** for the pre-escalation slice; a stable `_content_hash` is the
+  final dedup tie-break so the kept row never depends on Spark row order. If a call identity is missing the
+  feature builder **fails closed** (raises) rather than reorder nondeterministically. If Greylabs later adds a
+  native per-call id, set `NATIVE_CALL_ID_COL` in `02_silver_clean` to key on it directly. **Transcript
+  handling:** the feed carries a `Transcript` column (bronze), so silver **quarantines rows with a null/empty
+  transcript** (logged count) *before* dropping the transcript text.
 - **Single-source feature logic.** All ticket-grain maths lives in `escalation_features.py` and is invoked in
   Spark via `applyInPandas` (gold) and baked into the pyfunc (inference). The unit tests exercise the **exact**
   production code, not a copy.

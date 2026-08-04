@@ -42,7 +42,7 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 ID_COL = "ticket_id"
 DATETIME_COL = "call_datetime"  # MUST be a UTC instant (02_silver_clean sets this; IST kept as call_datetime_ist)
-CALL_ID_COL = "call_id"  # true per-call unique key — deterministic secondary sort + silver dedup key
+CALL_ID_COL = "call_id"  # per-ticket-scoped composite call key (02_silver_clean) — dedup + total-order sort
 TARGET_COL = "real_time_alert"  # cleaned: 'yes' / 'no' / 'inconclusive' / None
 LABEL_COL = "is_escalated"
 
@@ -268,15 +268,17 @@ def build_ticket_feature_record(calls: pd.DataFrame, training: bool = True) -> d
     if calls is None or len(calls) == 0:
         return None
 
-    # Deterministic ordering. Sort by call_datetime, then by call_id as a stable
-    # tie-breaker so two calls sharing a timestamp always order the same way
-    # regardless of the (arbitrary) order Spark handed the group to us. If a
-    # call_id column is somehow absent we fall back to a stable sort on the
-    # timestamp only (mergesort), but call_id is a required silver column.
-    sort_keys = [DATETIME_COL]
-    if CALL_ID_COL in calls.columns:
-        sort_keys.append(CALL_ID_COL)
-    g = calls.sort_values(sort_keys, kind="mergesort").reset_index(drop=True)
+    # Deterministic TOTAL ORDER. Sort by (call_datetime, call_id) — call_id is the per-ticket-scoped composite
+    # id built in silver, a UNIQUE per-call value, so it gives a fully deterministic total order that never
+    # depends on the arbitrary order Spark handed the group to us (BLOCKING-2). FAIL CLOSED if call_id is
+    # missing: silently falling back to timestamp-only ordering would reintroduce tie nondeterminism.
+    if CALL_ID_COL not in calls.columns:
+        raise ValueError(
+            f"Required per-call id column '{CALL_ID_COL}' is absent from the ticket's calls. It is the "
+            f"deterministic tie-break / dedup key; refusing to fall back to nondeterministic timestamp-only "
+            f"ordering. Ensure 02_silver_clean produced '{CALL_ID_COL}'. FAILING FAST."
+        )
+    g = calls.sort_values([DATETIME_COL, CALL_ID_COL], kind="mergesort").reset_index(drop=True)
     total_calls_in_ticket = len(g)
 
     flags = [to_null(f) for f in g[TARGET_COL].tolist()]
@@ -287,6 +289,11 @@ def build_ticket_feature_record(calls: pd.DataFrame, training: bool = True) -> d
     # Cut point: index of the first escalated call.
     cut = next((i for i, f in enumerate(flags) if f == "yes"), None)
     if cut is not None:
+        # INFERENCE-ONLY exclusion (BLOCKING-3): a ticket that has ALREADY escalated is not a prediction
+        # target — its outcome already fired, so scoring it is meaningless and pollutes the CX queue. Emit no
+        # record at inference. In TRAINING we keep it (label=1, strictly-before slice) so the model learns.
+        if not training:
+            return None
         pre = g.iloc[:cut]
         label = 1
     else:
@@ -421,15 +428,17 @@ def kfold_oof_encode(
 ) -> pd.DataFrame:
     """OUT-OF-FOLD smoothed target encoding for TRAINING rows (no leakage).
 
-    Each row's high-cardinality encoding is computed from statistics on the OTHER folds ONLY, so a row's own
-    label never enters its own feature value. This is the matrix the booster must TRAIN on (item 1). Fold
-    smoothing uses the full-``y`` global mean (matches the reference), and unseen categories fall back to it.
+    Each held-out row's encoding — BOTH the category statistics AND the smoothing prior — is computed from the
+    OTHER folds ONLY, so a row's own label never enters its own feature value, not even via the prior. This
+    matters most for rare high-cardinality categories, where the smoothing prior dominates the encoding: a
+    dataset-wide prior would leak the held-out fold's labels back into those rows (BLOCKING-1). Unseen
+    categories in a fold fall back to that fold's OWN out-of-fold prior. This is the matrix the booster TRAINS
+    on. (``compute_target_encode_maps`` — the FULL-data serving maps frozen into the pyfunc — is unchanged.)
 
     Returns a copy of ``X`` with ``cols`` replaced by their OOF encodings; all other columns are untouched.
     """
     from sklearn.model_selection import KFold
 
-    global_mean = float(y.mean())
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
     out = X.copy()
     for col in cols:
@@ -437,13 +446,15 @@ def kfold_oof_encode(
             continue
         oof = pd.Series(np.nan, index=X.index, dtype="float64")
         for tr_idx, val_idx in kf.split(X):
-            fold_maps, _ = compute_target_encode_maps(
-                X.iloc[tr_idx], y.iloc[tr_idx], [col], smoothing=smoothing, global_mean=global_mean
+            # Prior AND stats from the training folds only (global_mean=None -> derived from y.iloc[tr_idx]).
+            fold_maps, fold_prior = compute_target_encode_maps(
+                X.iloc[tr_idx], y.iloc[tr_idx], [col], smoothing=smoothing, global_mean=None
             )
             oof.iloc[val_idx] = (
-                X.iloc[val_idx][col].astype("object").map(fold_maps[col]).fillna(global_mean)
+                X.iloc[val_idx][col].astype("object").map(fold_maps[col]).fillna(fold_prior)
             )
-        out[col] = oof.fillna(global_mean)
+        # Any row not covered by a fold (should not happen with KFold) falls back to the full-data mean.
+        out[col] = oof.fillna(float(y.mean()))
     return out
 
 

@@ -508,7 +508,8 @@ print(f"Registered {REGISTERED_MODEL_NAME} version {registered_version}")
 # MAGIC Load the freshly-registered pyfunc and predict on the input example. A broken frozen-preprocessing
 # MAGIC package (bad code_paths, missing artifact, encoding mismatch) must ABORT here — a model that cannot
 # MAGIC reproduce its own predictions must never become champion or challenger. So any failure RAISES, and the
-# MAGIC round-trip output must match the locally-computed expected output within tolerance.
+# MAGIC round-trip output must match the locally-computed expected output under a STRICT absolute tolerance
+# MAGIC (`atol=1e-5, rtol=0`) — probabilities AND `predicted_flag` (item 5 hardening).
 
 # COMMAND ----------
 
@@ -519,17 +520,27 @@ if list(_rt.columns) != ["escalation_probability", "predicted_flag"]:
         f"Round-trip failed: registered model returned columns {list(_rt.columns)}, expected "
         f"['escalation_probability', 'predicted_flag']. Refusing to alias a broken model. FAILING FAST."
     )
-# The round-trip probabilities must match what we computed locally with the same frozen preprocessing.
+# STRICT absolute check (rtol=0): reloaded probabilities must match the locally-computed expected output.
 if not np.allclose(
     _rt["escalation_probability"].to_numpy(),
     output_example["escalation_probability"].to_numpy(),
     atol=1e-5,
+    rtol=0,
 ):
     raise RuntimeError(
         "Round-trip failed: reloaded model's probabilities differ from the locally-computed expected output "
-        "(frozen preprocessing did not survive log/load). Refusing to alias a broken model. FAILING FAST."
+        "(atol=1e-5, rtol=0) — frozen preprocessing did not survive log/load. Refusing to alias. FAILING FAST."
     )
-print(f"Round-trip OK — {_rt.shape[0]} rows, probabilities match local expected output within 1e-5.")
+# The served predicted_flag (prob >= frozen F2 threshold) must also match exactly.
+if not np.array_equal(
+    _rt["predicted_flag"].to_numpy().astype("int64"),
+    output_example["predicted_flag"].to_numpy().astype("int64"),
+):
+    raise RuntimeError(
+        "Round-trip failed: reloaded model's predicted_flag differs from the locally-computed expected output "
+        "(frozen F2 threshold did not survive log/load). Refusing to alias. FAILING FAST."
+    )
+print(f"Round-trip OK — {_rt.shape[0]} rows; probabilities (atol=1e-5,rtol=0) AND predicted_flag match.")
 
 # COMMAND ----------
 
@@ -537,8 +548,10 @@ print(f"Round-trip OK — {_rt.shape[0]} rows, probabilities match local expecte
 # MAGIC ## 12. Fail-closed champion/challenger gate
 # MAGIC A new version takes `@champion` ONLY when the model has no champion yet. Overwriting a live champion is a
 # MAGIC human decision — it REQUIRES `force_champion_override=yes` AND `alias_mode=champion`; otherwise the new
-# MAGIC version lands as `@challenger`. The gate fails CLOSED: only the precise "alias not found" error is read as
-# MAGIC "no champion"; any other registry error re-raises (never blindly overwrites).
+# MAGIC version lands as `@challenger`. The gate fails CLOSED: "no champion" is inferred ONLY from a
+# MAGIC RESOURCE_DOES_NOT_EXIST whose message matches the precise "alias … not found / does not exist" signature
+# MAGIC (model existence confirmed first); ANY other registry error — including one that merely mentions the
+# MAGIC alias name — re-raises and never auto-assigns champion.
 
 # COMMAND ----------
 
@@ -547,15 +560,24 @@ from mlflow.exceptions import RestException
 _NOT_FOUND_CODE = "RESOURCE_DOES_NOT_EXIST"
 
 
+import re
+
+# Precise "the ALIAS does not exist" signature. MLflow raises RESOURCE_DOES_NOT_EXIST with a message of the
+# form "Registered model alias <alias> not found" / "... does not exist". We require BOTH the not-found code
+# AND this specific "alias ... not found/does not exist" phrasing — never a loose substring match on the alias
+# name (which would swallow unrelated errors that merely mention "champion").
+_ALIAS_ABSENT_RE = re.compile(r"alias.*(not found|does not exist|not exist)", re.IGNORECASE)
+
+
 def _current_alias_version(client, model_name, alias):
-    """Return the version behind `alias`, or None ONLY when the alias is POSITIVELY absent (item 9).
+    """Return the version behind `alias`, or None ONLY when the alias is POSITIVELY absent (item 9 / H4).
 
     `RESOURCE_DOES_NOT_EXIST` is raised both when the ALIAS is missing AND when the whole MODEL is missing, so
-    the raw code is too broad. We first confirm the registered model exists (it must — we just registered a
-    version into it; if it doesn't, that's a real error, so we let it raise). Then a not-found that mentions
-    the alias name is read as "no champion". Anything we can't positively identify as an absent-alias signal
-    (auth / throttle / internal / a not-found that names the MODEL rather than the alias) RE-RAISES — the gate
-    fails closed and never auto-assigns champion on ambiguity.
+    the code alone is too broad. We first confirm the registered model exists (it must — we just registered a
+    version into it; if it doesn't, that's a real error, so we let it raise). Then we return None ONLY for a
+    not-found error whose message matches the precise alias-absent signature. Anything else — auth / throttle /
+    internal, a not-found that names the MODEL, or any error that merely contains the alias string — RE-RAISES.
+    The gate fails closed and never auto-assigns champion on ambiguity.
     """
     # Confirm the model exists first — raises RestException(RESOURCE_DOES_NOT_EXIST) naming the MODEL if not,
     # which we deliberately let propagate (a missing model here is a real bug, not "no champion").
@@ -564,10 +586,9 @@ def _current_alias_version(client, model_name, alias):
         return client.get_model_version_by_alias(model_name, alias).version
     except RestException as exc:
         code = getattr(exc, "error_code", None)
-        msg = str(getattr(exc, "message", "") or exc).lower()
-        # Positively an ABSENT ALIAS: not-found code AND the message references the alias (not the model).
-        if code == _NOT_FOUND_CODE and ("alias" in msg or f"'{alias}'" in msg or alias in msg):
-            return None
+        msg = str(getattr(exc, "message", "") or exc)
+        if code == _NOT_FOUND_CODE and _ALIAS_ABSENT_RE.search(msg):
+            return None  # positively "this alias does not exist" -> no current champion
         raise  # anything else -> fail LOUD, never overwrite blind
 
 

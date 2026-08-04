@@ -55,9 +55,15 @@ SILVER_TABLE = f"{CATALOG}.{SCHEMA}.greylabs_calls_clean"
 
 # IST is UTC+05:30. Greylabs `DateTime` has no tz — it IS local IST wall-clock time.
 IST_ZONE = "Asia/Kolkata"
-# Per-call unique id source (item 5). The reference notebook derives Call_Id = SHA256(Transcript); we do the
-# same. Repoint this to another genuinely per-call unique column if a future export lacks Transcript.
-CALL_ID_SOURCE = "Transcript"
+# Per-call identity (BLOCKING-2). The Greylabs export carries NO native call-ID column (confirmed against the
+# raw export: 21 columns, none a call id — the reference notebook's `Call_Id` was itself a derived
+# SHA256(Transcript) that it then dropped). Using SHA256(Transcript) ALONE collides across tickets whenever
+# transcript text is identical (short/templated/IVR fragments) and loses data. So call_id is a COMPOSITE hash
+# scoped to the ticket: SHA256(ticket_id || call_datetime || transcript). Identity cannot cross tickets, and
+# two distinct calls in one ticket differ on datetime and/or transcript. If Greylabs later adds a native
+# per-call id, set NATIVE_CALL_ID_COL to that raw column name to key on it directly instead.
+TRANSCRIPT_SOURCE = "Transcript"
+NATIVE_CALL_ID_COL = ""  # e.g. "Call Id" — set if the source ever provides a native per-call id
 
 print(f"raw    : {RAW_TABLE}")
 print(f"silver : {SILVER_TABLE}")
@@ -151,17 +157,48 @@ def _good_neutral_bad_map(clean_col):
 
 _tid = _clean_str("`Ticket Id`")
 
+# Per-call id (BLOCKING-2). Prefer a native source id if configured; otherwise a per-ticket-scoped COMPOSITE
+# hash so identity never collides across tickets. Both use the UTC instant string so the same wall-clock call
+# hashes stably regardless of session tz.
+_dt_key = F.date_format(F.col("_call_dt_utc"), "yyyy-MM-dd HH:mm:ss")
+if NATIVE_CALL_ID_COL:
+    _call_id_expr = F.col(f"`{NATIVE_CALL_ID_COL}`").cast("string")
+else:
+    _call_id_expr = F.sha2(
+        F.concat_ws(
+            "||",
+            _tid,
+            _dt_key,
+            F.coalesce(F.col(f"`{TRANSCRIPT_SOURCE}`").cast("string"), F.lit("")),
+        ),
+        256,
+    )
+# Content hash used ONLY as the final total-order tie-break in dedup — a stable function of the full row
+# content so two rows that somehow share call_id still order deterministically (never by Spark row order).
+_content_hash = F.sha2(
+    F.concat_ws(
+        "||",
+        _tid,
+        _dt_key,
+        F.coalesce(F.col(f"`{TRANSCRIPT_SOURCE}`").cast("string"), F.lit("")),
+        F.coalesce(F.col("`Real Time Alert (Answer)`").cast("string"), F.lit("")),
+        F.coalesce(F.col("`Weighted Average (Normalised Score)`").cast("string"), F.lit("")),
+        F.coalesce(F.col("`Customer Sentiment`").cast("string"), F.lit("")),
+    ),
+    256,
+)
+
 silver = raw.select(
     # ---- identity / time ----
     _tid.alias("ticket_id"),
-    # Per-call unique id = SHA256(transcript) (item 5) — the true dedup key + deterministic tie-break sort key.
-    F.sha2(F.col(f"`{CALL_ID_SOURCE}`").cast("string"), 256).alias("call_id"),
+    _call_id_expr.alias("call_id"),
+    _content_hash.alias("_content_hash"),  # transient — dropped before write (tie-break only)
     # CANONICAL time column = true UTC instant. The feature module orders on this and gold filters on this
     # (item 7). Kept first so downstream code that references `call_datetime` gets the UTC instant.
     F.col("_call_dt_utc").alias("call_datetime"),
     F.col("_call_dt_ist").alias("call_datetime_ist"),  # IST wall-clock — DISPLAY ONLY
     # Raw transcript kept transiently for the quarantine check below, then dropped before write.
-    F.col(f"`{CALL_ID_SOURCE}`").cast("string").alias("_transcript_raw"),
+    F.col(f"`{TRANSCRIPT_SOURCE}`").cast("string").alias("_transcript_raw"),
     # ---- numeric (cast + clamp) ----
     F.col("`Total Call Duration (In Seconds)`").cast("int").alias("total_call_duration"),
     F.greatest(F.col("`Total Non-Speech Duration (In Seconds)`").cast("int"), F.lit(0)).alias(
@@ -222,23 +259,27 @@ silver = silver.drop("_transcript_raw")
 
 # MAGIC %md
 # MAGIC ## 5. Deduplicate on the per-call key `call_id`
-# MAGIC The grain is one row per call. Dedup on `call_id` (SHA256 of the transcript — a true per-call id), NOT on
-# MAGIC `(ticket_id, call_datetime)`: two genuinely distinct calls that share a timestamp have different
-# MAGIC transcripts, hence different `call_id`s, so they are preserved (item 5). Ties on the SAME `call_id` are
-# MAGIC true duplicate ingests of one call; we keep one deterministically — ordered by `ingested_at` desc then
-# MAGIC by the stable content columns so the choice does not depend on same-run `ingested_at` collisions.
+# MAGIC The grain is one row per call. Dedup on the per-ticket-scoped composite `call_id` (BLOCKING-2), NOT on
+# MAGIC `(ticket_id, call_datetime)`: two genuinely distinct calls that share a timestamp differ in transcript,
+# MAGIC hence in `call_id`, so they are preserved. Rows that DO share a `call_id` are true duplicate ingests; we
+# MAGIC keep one via a FULLY DETERMINISTIC total order — `ingested_at` desc, then stable content columns, then
+# MAGIC `_content_hash` as the final tie-break — so the choice never depends on Spark row order even when
+# MAGIC `ingested_at`/datetime/alert all collide.
 
 # COMMAND ----------
 
 from pyspark.sql.window import Window
 
 w = Window.partitionBy("call_id").orderBy(
-    F.col("ingested_at").desc(), F.col("call_datetime").asc(), F.col("real_time_alert").asc_nulls_last()
+    F.col("ingested_at").desc(),
+    F.col("call_datetime").asc(),
+    F.col("real_time_alert").asc_nulls_last(),
+    F.col("_content_hash").asc(),  # stable final total-order tie-break (never Spark row order)
 )
 silver = (
     silver.withColumn("_rn", F.row_number().over(w))
     .filter(F.col("_rn") == 1)
-    .drop("_rn")
+    .drop("_rn", "_content_hash")
 )
 
 # COMMAND ----------

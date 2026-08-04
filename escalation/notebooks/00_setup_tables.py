@@ -63,14 +63,15 @@ print(f"Schema ready: {CATALOG}.{SCHEMA}")
 # MAGIC Exact Greylabs export column names, ALL string-typed (the raw feed sends everything as text). Only created
 # MAGIC when absent — if Greylabs is already writing here live, this is a no-op and the live data is untouched.
 # MAGIC
-# MAGIC **`Transcript` is a REQUIRED source field** (`CONFIGURE`-visible in MANIFESTO). The reference notebook
-# MAGIC derives a per-call unique id as `SHA256(Transcript)`; `02_silver_clean` does the same to produce
-# MAGIC `call_id`, which is (a) the true per-call **dedup key** (two calls sharing a `DateTime` are still
-# MAGIC distinct — item 5) and (b) the deterministic **secondary sort key** for the pre-escalation slice
-# MAGIC (item 4). `02_silver_clean` also **quarantines rows with a null/empty transcript** before dropping the
-# MAGIC transcript text (item 6). If a future Greylabs export truly lacks `Transcript`, supply an alternative
-# MAGIC per-call id column and repoint `CALL_ID_SOURCE` in `02_silver_clean` — do NOT fall back to
-# MAGIC `(ticket_id, DateTime)`, which silently collapses distinct calls.
+# MAGIC **`Transcript` is a REQUIRED source field** (`CONFIGURE`-visible in MANIFESTO). The export carries NO
+# MAGIC native per-call id, so `02_silver_clean` builds `call_id` as a per-ticket-scoped COMPOSITE hash
+# MAGIC `SHA256(ticket_id || call_datetime || transcript)`. This is (a) the per-call **dedup key** — distinct
+# MAGIC calls sharing a `DateTime` differ in transcript, and identity cannot collide ACROSS tickets — and (b) the
+# MAGIC deterministic tie-break for the pre-escalation slice's total order (BLOCKING-2). `02_silver_clean` also
+# MAGIC **quarantines rows with a null/empty transcript** (logged count) before dropping the transcript text.
+# MAGIC If Greylabs later adds a native per-call id, set `NATIVE_CALL_ID_COL` in `02_silver_clean` to key on it
+# MAGIC directly — do NOT fall back to `(ticket_id, DateTime)`, which silently collapses distinct same-timestamp
+# MAGIC calls.
 
 # COMMAND ----------
 

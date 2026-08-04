@@ -447,6 +447,37 @@ def test_oof_single_fold_holdout_pulls_toward_global_mean():
     assert not np.allclose(m_oof, full_maps["qrc_category"]["m"]), "OOF did not exclude own-fold labels."
 
 
+def test_oof_prior_excludes_held_out_fold_label():
+    """BLOCKING-1 regression: a held-out row's OOF encoding must be INDEPENDENT of its own label — including
+    via the smoothing prior. Flip one held-out row's label (X unchanged, so KFold membership is identical);
+    that row's encoding must not change.
+
+    Uses a RARE category so the smoothing prior dominates its encoding — exactly where a dataset-wide prior
+    (the old bug) leaked the held-out label. This test FAILS on the old `global_mean = y.mean()` prior (the
+    flipped row's encoding shifts by the leaked prior term) and PASSES once the prior is per-fold.
+    """
+    # 90 'common' (all label 0) + 10 'rare' (mixed) — smoothing=10 makes the prior dominate 'rare' rows.
+    X = pd.DataFrame({"qrc_category": ["common"] * 90 + ["rare"] * 10})
+    y = pd.Series([0] * 90 + [1, 0, 1, 0, 1, 0, 1, 0, 1, 0])
+    target = 90  # a 'rare', held-out row
+
+    enc_before = ef.kfold_oof_encode(
+        X, y, ["qrc_category"], n_splits=5, smoothing=10.0, random_state=42
+    )["qrc_category"]
+
+    y_flipped = y.copy()
+    y_flipped.iloc[target] = 1 - y_flipped.iloc[target]
+    enc_after = ef.kfold_oof_encode(
+        X, y_flipped, ["qrc_category"], n_splits=5, smoothing=10.0, random_state=42
+    )["qrc_category"]
+
+    # The flipped row's OWN encoding must be identical (its label — via stats AND prior — is out-of-fold).
+    assert enc_before.iloc[target] == pytest.approx(enc_after.iloc[target], abs=1e-12), (
+        "Held-out row's OOF encoding changed when its own label flipped — the smoothing prior is leaking the "
+        "held-out fold's labels (BLOCKING-1)."
+    )
+
+
 # --- 12(b): deterministic pre-escalation slicing under TIED timestamps (item 4) ---
 def test_pre_escalation_slice_deterministic_under_tied_timestamps():
     """Same calls, shuffled input order, tied timestamps -> identical slice + features (call_id tie-break)."""
@@ -476,6 +507,49 @@ def test_pre_escalation_slice_deterministic_under_tied_timestamps():
         ), f"feature {k} differs under reordering: {rec_ordered[k]} vs {rec_shuffled[k]}"
     # gl_customer_sentiment over {good, neutral} pre-slice = neutral (bad c3/c4 are excluded).
     assert rec_ordered["gl_customer_sentiment"] == "neutral"
+
+
+def test_missing_call_id_fails_closed():
+    """BLOCKING-2: if the per-call id column is absent, the feature builder must FAIL CLOSED (raise), not
+    silently fall back to nondeterministic timestamp-only ordering."""
+    calls = make_calls([{"real_time_alert": "no"}, {"real_time_alert": "no"}])
+    calls_no_id = calls.drop(columns=[ef.CALL_ID_COL])
+    with pytest.raises(ValueError):
+        ef.build_ticket_feature_record(calls_no_id)
+
+
+# --- BLOCKING-3: already-escalated tickets are NOT scored at inference ---
+def test_already_escalated_ticket_not_scored_at_inference():
+    """An escalated ticket yields a TRAINING record (label 1, strictly-before slice) but NO inference record."""
+    rows = [
+        {"call_id": "c1", "customer_sentiment": "neutral", "real_time_alert": "no"},
+        {"call_id": "c2", "customer_sentiment": "bad", "real_time_alert": "yes"},  # escalation fired
+        {"call_id": "c3", "customer_sentiment": "bad", "real_time_alert": "no"},
+    ]
+    calls = make_calls(rows)
+
+    # Training: still produced (the model must learn from pre-escalation calls).
+    rec_train = ef.build_ticket_feature_record(calls, training=True)
+    assert rec_train is not None
+    assert rec_train["is_escalated"] == 1
+    assert rec_train["num_calls_considered"] == 1  # only c1 (strictly before c2)
+
+    # Inference: the escalation already fired -> no record (nothing to intervene on).
+    rec_infer = ef.build_ticket_feature_record(calls, training=False)
+    assert rec_infer is None
+
+
+def test_not_yet_escalated_ticket_scored_at_inference():
+    """A ticket with no 'yes' alert IS scored at inference (label 0, all calls in the window)."""
+    rows = [
+        {"call_id": "c1", "customer_sentiment": "neutral", "real_time_alert": "no"},
+        {"call_id": "c2", "customer_sentiment": "bad", "real_time_alert": "no"},
+    ]
+    calls = make_calls(rows)
+    rec_infer = ef.build_ticket_feature_record(calls, training=False)
+    assert rec_infer is not None
+    assert rec_infer["is_escalated"] == 0
+    assert rec_infer["num_calls_considered"] == 2
 
 
 # --- 12(c): split-by-ticket keeps all rows of a ticket in one split + is stable (item 3) ---
