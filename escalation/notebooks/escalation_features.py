@@ -129,6 +129,36 @@ def normalize_qrc_subcategory(value):
     return s.title()
 
 
+# Null sentinel for content hashing — a distinctive string so NULL != '' != 'NULL'. Must match the literal
+# used in the Spark expression in 02_silver_clean so the notebook and this reference implementation agree.
+CONTENT_HASH_NULL_SENTINEL = " __NULL__ "
+
+
+def row_content_hash(row: dict, columns=None) -> str:
+    """Deterministic FULL-ROW content hash used as the silver dedup tie-break (BLOCKING-2 residual).
+
+    Produces a TRUE TOTAL ORDER over rows: two rows differing in ANY column get different hashes, and only
+    rows equal across ALL considered columns collide. Mirrors the Spark expression in 02_silver_clean exactly:
+      * columns considered in DETERMINISTIC (sorted) order;
+      * each value canonicalized as its ``str(...)`` with None -> a distinctive null sentinel;
+      * each column value hashed FIRST (fixed-width sha256 hex, no delimiters), then the per-column hashes
+        concatenated with '||' and hashed again — per-column hashing removes delimiter-collision ambiguity
+        (['a','b||c'] vs ['a||b','c']) that a raw concat would allow.
+
+    ``columns`` defaults to every key in ``row`` (sorted). This is the single source of truth the pure-Python
+    tie-break test exercises; the Spark notebook builds the identical hash over the bronze source columns.
+    """
+    import hashlib
+
+    cols = sorted(row.keys()) if columns is None else sorted(columns)
+    per_col = []
+    for c in cols:
+        v = row.get(c)
+        s = CONTENT_HASH_NULL_SENTINEL if v is None else str(v)
+        per_col.append(hashlib.sha256(s.encode("utf-8")).hexdigest())
+    return hashlib.sha256("||".join(per_col).encode("utf-8")).hexdigest()
+
+
 def parse_repeat_call_flag(value):
     """Parse the raw Greylabs `Repeat Calls` free text into a boolean flag.
 
@@ -524,6 +554,45 @@ def assign_split_by_ticket(
         else:
             labels.append("train")
     return pd.Series(labels, index=ids.index)
+
+
+# ---------------------------------------------------------------------------
+# Champion-gate helpers (H4). Pure functions of an MLflow-client-like object so the fail-closed / structural
+# alias-presence logic is unit-testable without a live registry.
+# ---------------------------------------------------------------------------
+def alias_map(registered_model) -> dict:
+    """Extract ``{alias_name: version}`` from a RegisteredModel across MLflow shapes.
+
+    ``RegisteredModel.aliases`` is a list of RegisteredModelAlias(alias, version) on modern MLflow and a plain
+    ``{alias: version}`` dict on some builds. Normalize both to a dict; anything unexpected -> empty (treated
+    as 'no aliases' — safe, because a champion we cannot see is one we won't overwrite).
+    """
+    aliases = getattr(registered_model, "aliases", None)
+    if aliases is None:
+        return {}
+    if isinstance(aliases, dict):
+        return {str(k): str(v) for k, v in aliases.items()}
+    out = {}
+    for a in aliases:  # list of RegisteredModelAlias-like objects
+        name = getattr(a, "alias", None)
+        ver = getattr(a, "version", None)
+        if name is not None and ver is not None:
+            out[str(name)] = str(ver)
+    return out
+
+
+def resolve_alias_version(client, model_name, alias):
+    """Return the version behind ``alias``, or None ONLY when the alias is PROVABLY absent (H4).
+
+    STRUCTURAL, not free-text: fetch the registered model and inspect its alias SET (authoritative on modern
+    MLflow / UC, where ``RegisteredModel.aliases`` is populated). 'No champion' is inferred ONLY when ``alias``
+    is genuinely not in that set; if present, its version is returned directly from the set. ANY exception from
+    fetching the model (missing model, permission, network, a not-found NOT tied to this alias) PROPAGATES —
+    the gate fails closed and never auto-assigns champion on ambiguity. No message parsing is involved, so an
+    error like 'alias lookup failed: model not found' can never be misread as 'no champion'.
+    """
+    rm = client.get_registered_model(model_name)  # missing model -> propagates (real bug, not "no champion")
+    return alias_map(rm).get(alias)  # present -> its version; provably absent -> None
 
 
 def apply_target_encode(series: pd.Series, encode_map: dict, global_mean: float) -> pd.Series:

@@ -548,51 +548,18 @@ print(f"Round-trip OK — {_rt.shape[0]} rows; probabilities (atol=1e-5,rtol=0) 
 # MAGIC ## 12. Fail-closed champion/challenger gate
 # MAGIC A new version takes `@champion` ONLY when the model has no champion yet. Overwriting a live champion is a
 # MAGIC human decision — it REQUIRES `force_champion_override=yes` AND `alias_mode=champion`; otherwise the new
-# MAGIC version lands as `@challenger`. The gate fails CLOSED: "no champion" is inferred ONLY from a
-# MAGIC RESOURCE_DOES_NOT_EXIST whose message matches the precise "alias … not found / does not exist" signature
-# MAGIC (model existence confirmed first); ANY other registry error — including one that merely mentions the
-# MAGIC alias name — re-raises and never auto-assigns champion.
+# MAGIC version lands as `@challenger`. The gate fails CLOSED and STRUCTURAL: "no champion" is inferred ONLY
+# MAGIC when the alias is provably absent from the registered model's alias SET (no free-text message parsing).
+# MAGIC ANY other error — missing model, permission, network, or a not-found not tied to this alias — re-raises
+# MAGIC and never auto-assigns champion.
 
 # COMMAND ----------
 
-from mlflow.exceptions import RestException
-
-_NOT_FOUND_CODE = "RESOURCE_DOES_NOT_EXIST"
-
-
-import re
-
-# Precise "the ALIAS does not exist" signature. MLflow raises RESOURCE_DOES_NOT_EXIST with a message of the
-# form "Registered model alias <alias> not found" / "... does not exist". We require BOTH the not-found code
-# AND this specific "alias ... not found/does not exist" phrasing — never a loose substring match on the alias
-# name (which would swallow unrelated errors that merely mention "champion").
-_ALIAS_ABSENT_RE = re.compile(r"alias.*(not found|does not exist|not exist)", re.IGNORECASE)
-
-
-def _current_alias_version(client, model_name, alias):
-    """Return the version behind `alias`, or None ONLY when the alias is POSITIVELY absent (item 9 / H4).
-
-    `RESOURCE_DOES_NOT_EXIST` is raised both when the ALIAS is missing AND when the whole MODEL is missing, so
-    the code alone is too broad. We first confirm the registered model exists (it must — we just registered a
-    version into it; if it doesn't, that's a real error, so we let it raise). Then we return None ONLY for a
-    not-found error whose message matches the precise alias-absent signature. Anything else — auth / throttle /
-    internal, a not-found that names the MODEL, or any error that merely contains the alias string — RE-RAISES.
-    The gate fails closed and never auto-assigns champion on ambiguity.
-    """
-    # Confirm the model exists first — raises RestException(RESOURCE_DOES_NOT_EXIST) naming the MODEL if not,
-    # which we deliberately let propagate (a missing model here is a real bug, not "no champion").
-    client.get_registered_model(model_name)
-    try:
-        return client.get_model_version_by_alias(model_name, alias).version
-    except RestException as exc:
-        code = getattr(exc, "error_code", None)
-        msg = str(getattr(exc, "message", "") or exc)
-        if code == _NOT_FOUND_CODE and _ALIAS_ABSENT_RE.search(msg):
-            return None  # positively "this alias does not exist" -> no current champion
-        raise  # anything else -> fail LOUD, never overwrite blind
-
-
-existing_champion = _current_alias_version(_uc_client, REGISTERED_MODEL_NAME, "champion")
+# Structural, fail-closed alias-presence check lives in the shared module (ef.resolve_alias_version) so it is
+# unit-tested without a live registry. It inspects the registered model's alias SET (no free-text parsing):
+# 'no champion' ONLY when the alias is provably absent from that set, else its version; ANY other error
+# (missing model, permission, network, a not-found not tied to this alias) propagates -> fail closed.
+existing_champion = ef.resolve_alias_version(_uc_client, REGISTERED_MODEL_NAME, "champion")
 
 if ALIAS_MODE == "none":
     chosen_alias = None

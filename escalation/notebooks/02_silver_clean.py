@@ -173,20 +173,23 @@ else:
         ),
         256,
     )
-# Content hash used ONLY as the final total-order tie-break in dedup — a stable function of the full row
-# content so two rows that somehow share call_id still order deterministically (never by Spark row order).
-_content_hash = F.sha2(
-    F.concat_ws(
-        "||",
-        _tid,
-        _dt_key,
-        F.coalesce(F.col(f"`{TRANSCRIPT_SOURCE}`").cast("string"), F.lit("")),
-        F.coalesce(F.col("`Real Time Alert (Answer)`").cast("string"), F.lit("")),
-        F.coalesce(F.col("`Weighted Average (Normalised Score)`").cast("string"), F.lit("")),
-        F.coalesce(F.col("`Customer Sentiment`").cast("string"), F.lit("")),
-    ),
-    256,
-)
+# Content hash used ONLY as the final total-order tie-break in dedup. It must be a TRUE TOTAL ORDER over the
+# FULL row (BLOCKING-2 residual): two rows tied on call_id but differing in ANY source column must sort
+# deterministically, and only rows byte-identical across ALL columns collapse. We therefore hash over EVERY
+# source column, not a subset:
+#   * deterministic column order — sort the source column names;
+#   * null-safe canonicalization — coalesce each value to a distinctive sentinel so NULL != '' != 'NULL';
+#   * collision-free composition — hash each column value FIRST (fixed-width 64-char hex, no delimiters), then
+#     concat those per-column hashes in the fixed order. Per-column hashing removes any delimiter-collision
+#     ambiguity (e.g. ['a','b||c'] vs ['a||b','c']) that a plain concat_ws of raw values would have.
+# Source columns = the bronze columns only (exclude the transient parse helpers _call_dt_ist / _call_dt_utc);
+# the source `DateTime` is among them, so wall-clock content is covered.
+_NULL_SENTINEL = " __NULL__ "  # == escalation_features.CONTENT_HASH_NULL_SENTINEL (kept in sync; see test)
+_SOURCE_COLS = sorted(c for c in raw.columns if c not in ("_call_dt_ist", "_call_dt_utc"))
+_col_hashes = [
+    F.sha2(F.coalesce(F.col(f"`{c}`").cast("string"), F.lit(_NULL_SENTINEL)), 256) for c in _SOURCE_COLS
+]
+_content_hash = F.sha2(F.concat_ws("||", *_col_hashes), 256)
 
 silver = raw.select(
     # ---- identity / time ----
@@ -261,10 +264,12 @@ silver = silver.drop("_transcript_raw")
 # MAGIC ## 5. Deduplicate on the per-call key `call_id`
 # MAGIC The grain is one row per call. Dedup on the per-ticket-scoped composite `call_id` (BLOCKING-2), NOT on
 # MAGIC `(ticket_id, call_datetime)`: two genuinely distinct calls that share a timestamp differ in transcript,
-# MAGIC hence in `call_id`, so they are preserved. Rows that DO share a `call_id` are true duplicate ingests; we
-# MAGIC keep one via a FULLY DETERMINISTIC total order — `ingested_at` desc, then stable content columns, then
-# MAGIC `_content_hash` as the final tie-break — so the choice never depends on Spark row order even when
-# MAGIC `ingested_at`/datetime/alert all collide.
+# MAGIC hence in `call_id`, so they are preserved. Rows that DO share a `call_id` are ordered by a FULLY
+# MAGIC DETERMINISTIC TOTAL ORDER — `ingested_at` desc, then `call_datetime`/`real_time_alert`, then
+# MAGIC `_content_hash` (a hash over ALL source columns) as the final tie-break. Because `_content_hash` covers
+# MAGIC every column, any two rows that differ in ANY column get a stable, Spark-order-independent ordering, and
+# MAGIC only rows byte-identical across all columns collapse (genuine duplicates). The choice never depends on
+# MAGIC Spark row order.
 
 # COMMAND ----------
 

@@ -518,6 +518,126 @@ def test_missing_call_id_fails_closed():
         ef.build_ticket_feature_record(calls_no_id)
 
 
+# The columns the OLD (partial) tie-break hashed — kept here only to PROVE the new hash is not a subset hash.
+_OLD_SUBSET_COLS = [
+    "Ticket Id",
+    "DateTime",
+    "Transcript",
+    "Real Time Alert (Answer)",
+    "Weighted Average (Normalised Score)",
+    "Customer Sentiment",
+]
+
+
+def test_content_hash_is_full_row_total_order():
+    """BLOCKING-2 residual: the dedup tie-break (`row_content_hash`) must be a TRUE TOTAL ORDER over the FULL
+    row. Two rows IDENTICAL on the old 6-field subset but DIFFERING in an un-hashed column (here
+    `Agent Talk Duration`) must get DIFFERENT hashes — a subset hash would tie them and let dedup fall back to
+    nondeterministic Spark row order.
+
+    This test FAILS if the implementation reverts to hashing only a column subset, and PASSES for the
+    full-row hash.
+    """
+    # Two rows agreeing on every field the old subset hashed, differing ONLY in an un-hashed column.
+    base = {
+        "Ticket Id": "T1",
+        "DateTime": "01-09-2025 05:00:00",
+        "Transcript": "hello",
+        "Real Time Alert (Answer)": "No",
+        "Weighted Average (Normalised Score)": "7.0",
+        "Customer Sentiment": "Neutral",
+        "Agent Talk Duration (In Seconds)": "40",
+        "Empathy (Answer)": "Good",
+        "QRC (Category)": "Complaint",
+    }
+    row_a = dict(base)
+    row_b = dict(base, **{"Agent Talk Duration (In Seconds)": "999"})  # differs in an un-hashed column
+
+    # Full-row hash distinguishes them...
+    h_a = ef.row_content_hash(row_a)
+    h_b = ef.row_content_hash(row_b)
+    assert h_a != h_b, "full-row content hash must differ when ANY column differs (tie-break not total order)"
+
+    # ...but the OLD subset hash would NOT (this is exactly the residual bug we fixed).
+    h_a_subset = ef.row_content_hash(row_a, columns=_OLD_SUBSET_COLS)
+    h_b_subset = ef.row_content_hash(row_b, columns=_OLD_SUBSET_COLS)
+    assert h_a_subset == h_b_subset, "sanity: the old 6-field subset genuinely ties these rows"
+
+    # Byte-identical rows collapse (same hash) — genuine duplicates.
+    assert ef.row_content_hash(dict(base)) == ef.row_content_hash(dict(base))
+
+    # Deterministic total order: sorting rows by (call_id, content_hash) is stable regardless of input order.
+    rows = [row_b, row_a]  # deliberately "wrong" order
+    order1 = sorted(rows, key=lambda r: ef.row_content_hash(r))
+    order2 = sorted(list(reversed(rows)), key=lambda r: ef.row_content_hash(r))
+    assert [ef.row_content_hash(r) for r in order1] == [ef.row_content_hash(r) for r in order2]
+
+    # Null-safety: None != "" != "NULL" (distinct sentinels -> distinct hashes).
+    assert ef.row_content_hash({"x": None}) != ef.row_content_hash({"x": ""})
+    assert ef.row_content_hash({"x": None}) != ef.row_content_hash({"x": "NULL"})
+
+
+# --- H4 residual: champion gate is STRUCTURAL + fail-closed (no free-text parsing) ---
+class _FakeRegisteredModel:
+    def __init__(self, aliases):
+        self.aliases = aliases  # list of objects with .alias/.version, OR a dict, OR None
+
+
+class _FakeAliasObj:
+    def __init__(self, alias, version):
+        self.alias = alias
+        self.version = version
+
+
+class _FakeClient:
+    """Minimal MLflow-client stand-in for resolve_alias_version. `get_registered_model` returns a model with
+    a configurable alias set (or raises)."""
+
+    def __init__(self, model=None, model_error=None):
+        self._model = model
+        self._model_error = model_error
+
+    def get_registered_model(self, name):
+        if self._model_error is not None:
+            raise self._model_error
+        return self._model
+
+
+def test_champion_gate_absent_alias_returns_none():
+    """Alias provably absent from the model's alias SET -> None ('no champion'), without touching the free-text
+    alias lookup path."""
+    client = _FakeClient(model=_FakeRegisteredModel(aliases=[_FakeAliasObj("challenger", "3")]))
+    assert ef.resolve_alias_version(client, "cat.sch.model", "champion") is None
+    # No alias set means no champion either.
+    client_empty = _FakeClient(model=_FakeRegisteredModel(aliases=[]))
+    assert ef.resolve_alias_version(client_empty, "cat.sch.model", "champion") is None
+
+
+def test_champion_gate_present_alias_returns_version():
+    """Alias present in the set -> its version (structurally, no lookup needed)."""
+    client = _FakeClient(
+        model=_FakeRegisteredModel(aliases=[_FakeAliasObj("champion", "7"), _FakeAliasObj("challenger", "8")])
+    )
+    assert ef.resolve_alias_version(client, "cat.sch.model", "champion") == "7"
+    # dict-shaped aliases are also supported.
+    client_dict = _FakeClient(model=_FakeRegisteredModel(aliases={"champion": 9}))
+    assert ef.resolve_alias_version(client_dict, "cat.sch.model", "champion") == "9"
+
+
+def test_champion_gate_non_alias_error_reraises_fail_closed():
+    """H4: a NON-alias error must RE-RAISE, never be read as 'no champion'. A message that merely mentions
+    'alias' and 'not found' but refers to the MODEL (the old regex hole) must NOT be swallowed."""
+
+    class _ModelNotFound(RuntimeError):
+        pass
+
+    # get_registered_model raises (e.g. 'alias lookup failed: model not found', permission, network) — the old
+    # message-regex would have mis-read this as 'no champion'; the structural check must propagate it.
+    client = _FakeClient(model_error=_ModelNotFound("alias lookup failed: model not found"))
+    with pytest.raises(_ModelNotFound):
+        ef.resolve_alias_version(client, "cat.sch.model", "champion")
+
+
 # --- BLOCKING-3: already-escalated tickets are NOT scored at inference ---
 def test_already_escalated_ticket_not_scored_at_inference():
     """An escalated ticket yields a TRAINING record (label 1, strictly-before slice) but NO inference record."""
