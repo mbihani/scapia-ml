@@ -12,7 +12,7 @@
 # MAGIC * One row per ticket. Only calls **before** the first `real_time_alert='yes'` call are used
 # MAGIC   (pre-escalation window). Tickets whose FIRST call already escalated are excluded.
 # MAGIC * **Label** (`is_escalated`) = 1 if ANY call in the ticket escalated, else 0. Training only.
-# MAGIC * The **19 model features** = 12 numeric + 4 GL worst-of + 4 high-cardinality (raw strings; target-encoded
+# MAGIC * The **20 model features** = 12 numeric + 4 GL worst-of + 4 high-cardinality (raw strings; target-encoded
 # MAGIC   later at training). Plus metadata columns (`first_call_datetime`, `last_call_datetime`,
 # MAGIC   `total_calls_in_ticket`, `feature_computed_at`) that are NOT model inputs.
 # MAGIC
@@ -102,11 +102,16 @@ print(f"  high-card ({len(ef.CATEGORICAL_HIGH_CARD_FEATURES)}): {ef.CATEGORICAL_
 
 from pyspark.sql import functions as F
 
+# UTC session tz so current_timestamp() (used in the active-ticket filter) and stored instants agree (item 7).
+spark.conf.set("spark.sql.session.timeZone", "UTC")
+
 silver = spark.table(SILVER_TABLE).filter("NOT is_quarantined")
 
-# Only the columns the feature builder needs (keeps the pandas groups small).
+# Only the columns the feature builder needs (keeps the pandas groups small). `call_id` is included so the
+# feature module can break tied `call_datetime` values deterministically (item 4); `call_datetime` here is the
+# UTC instant produced by 02_silver_clean.
 FEATURE_INPUT_COLS = [
-    "ticket_id", "call_datetime",
+    "ticket_id", "call_id", "call_datetime",
     "total_call_duration", "total_nonspeech_duration",
     "agent_talk_duration", "customer_talk_duration", "weighted_average",
     "empathy", "agent_sentiment", "customer_sentiment", "effective_communication",
@@ -192,7 +197,10 @@ gold = gold.withColumn("feature_computed_at", F.current_timestamp())
 
 # MAGIC %md
 # MAGIC ## 5. Inference recency filter
-# MAGIC In inference mode keep only tickets whose last call is recent (still "active"). Training keeps all history.
+# MAGIC In inference mode keep only tickets whose LAST CALL is recent (still "active"). This filters on the
+# MAGIC ticket's actual last-call timestamp (`last_call_datetime`, a UTC instant), NOT on when features were
+# MAGIC computed — a ticket is "active" because a customer called recently. Compared against `current_timestamp()`
+# MAGIC under a UTC session tz, so both sides are the same instant scale (item 7). Training keeps all history.
 
 # COMMAND ----------
 
@@ -202,7 +210,7 @@ if MODE == "inference":
     cutoff = F.current_timestamp() - F.expr(f"INTERVAL {ACTIVE_TICKET_WINDOW_HOURS} HOURS")
     before = gold.count()
     gold = gold.filter(F.col("last_call_datetime") >= cutoff)
-    print(f"inference recency filter: kept tickets with last call within {ACTIVE_TICKET_WINDOW_HOURS}h")
+    print(f"inference recency filter: kept tickets with last call within {ACTIVE_TICKET_WINDOW_HOURS}h (UTC)")
     print(f"  {before:,} -> {gold.count():,} tickets")
 
 # COMMAND ----------

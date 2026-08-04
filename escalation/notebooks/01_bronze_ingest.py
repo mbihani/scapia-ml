@@ -82,22 +82,29 @@ if INGEST_MODE == "load_file":
         reader = reader.option("header", "true").option("multiLine", "true").option("escape", '"')
     src = reader.load(BRONZE_SOURCE_PATH)
 
-    # Keep only columns that exist in the target bronze schema (by exact name).
+    from pyspark.sql import functions as F
+
+    # Align the source to the FULL bronze schema (item 14): present columns are cast to string; absent columns
+    # are materialized as typed NULLs. Selecting the full target column list (not just present ones) means the
+    # appended DataFrame's schema matches the table exactly, so `append` with mergeSchema disabled succeeds —
+    # this is what actually makes the "missing source columns become NULL" behavior hold.
     target_cols = [f.name for f in spark.table(RAW_TABLE).schema.fields]
-    keep = [c for c in src.columns if c in target_cols]
+    present = [c for c in target_cols if c in src.columns]
     missing = [c for c in target_cols if c not in src.columns]
-    if not keep:
+    if not present:
         raise ValueError(
             f"Source file has no columns matching the bronze schema. Source cols: {src.columns}. "
             f"Expected some of: {target_cols}. FAILING FAST."
         )
     if missing:
-        print(f"WARNING: source is missing {len(missing)} bronze columns (they will be NULL): {missing}")
+        print(f"WARNING: source is missing {len(missing)} bronze columns (written as NULL): {missing}")
 
-    # Cast everything to string (bronze is all-string) and align to target column order.
-    from pyspark.sql import functions as F
-
-    src_aligned = src.select([F.col(f"`{c}`").cast("string").alias(c) for c in keep])
+    select_exprs = [
+        F.col(f"`{c}`").cast("string").alias(c) if c in src.columns
+        else F.lit(None).cast("string").alias(c)
+        for c in target_cols  # full schema, in table column order
+    ]
+    src_aligned = src.select(select_exprs)
     n_in = src_aligned.count()
     src_aligned.write.mode("append").option("mergeSchema", "false").saveAsTable(RAW_TABLE)
     print(f"Appended {n_in:,} rows into {RAW_TABLE} from {BRONZE_SOURCE_PATH}")

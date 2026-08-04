@@ -37,6 +37,7 @@ _BASE_TS = pd.Timestamp("2025-09-01 00:00:00")
 
 _ALL_COLS = [
     ef.ID_COL,
+    ef.CALL_ID_COL,
     ef.DATETIME_COL,
     "total_call_duration",
     "total_nonspeech_duration",
@@ -61,6 +62,9 @@ def make_calls(rows, ticket_id="T1"):
     for i, r in enumerate(rows):
         rec = {
             ef.ID_COL: ticket_id,
+            # Default call_id is unique+ordered per row so it never perturbs the primary datetime sort; tests
+            # that exercise tie-breaking pass explicit call_id values.
+            ef.CALL_ID_COL: r.get("call_id", f"{ticket_id}-call-{i:04d}"),
             ef.DATETIME_COL: r.get("dt", _BASE_TS + pd.Timedelta(hours=i)),
             "total_call_duration": r.get("total_call_duration", 100),
             "total_nonspeech_duration": r.get("total_nonspeech_duration", 10),
@@ -381,3 +385,131 @@ def test_build_model_matrix_frozen_order_and_encoding():
     # high-card: seen -> 0.4, unseen -> global_mean 0.2
     assert X["scapia_category"].iloc[0] == pytest.approx(0.4)
     assert X["scapia_sub_category"].iloc[0] == pytest.approx(0.2)
+
+
+# ===========================================================================
+# REGRESSION TESTS for the cross-review blockers (item 12).
+# These would have FAILED against the pre-fix code (target leakage / nondeterminism).
+# ===========================================================================
+
+
+# --- 12(a): OOF target encoding EXCLUDES each row's own label (item 1) ------
+def test_oof_target_encode_excludes_own_label():
+    """The TRAINING encoding must be out-of-fold: a row's own label must NOT enter its own encoded value.
+
+    Construct a category present in exactly ONE fold-worth of rows with an extreme label, and assert the OOF
+    encoding of those rows differs from the full-map encoding (which DOES include their own labels). If the
+    training path used the full maps (the pre-fix bug), these would be equal.
+    """
+    rng = np.random.default_rng(7)
+    n = 250
+    cats = rng.choice(["a", "b", "c"], size=n)
+    X = pd.DataFrame({"qrc_category": cats})
+    # 'c' perfectly predicts the label -> full-map encoding for 'c' rows is ~1.0 (includes their own labels),
+    # but OOF folds that hold out some 'c' rows pull their encoding toward the global mean.
+    y = pd.Series((cats == "c").astype(int))
+
+    X_oof = ef.kfold_oof_encode(X, y, ["qrc_category"], n_splits=5, smoothing=10.0, random_state=42)
+    full_maps, gm = ef.compute_target_encode_maps(X, y, ["qrc_category"], smoothing=10.0)
+    X_full = ef.apply_target_encode(X["qrc_category"], full_maps["qrc_category"], gm)
+
+    # The two encodings must DIFFER on the training rows (proves OOF is not just the full map).
+    assert not np.allclose(X_oof["qrc_category"].to_numpy(), X_full.to_numpy()), (
+        "OOF training encoding equals the full-map encoding — that is target leakage (item 1)."
+    )
+    # And OOF must be deterministic across repeated runs (fixed seed).
+    X_oof2 = ef.kfold_oof_encode(X, y, ["qrc_category"], n_splits=5, smoothing=10.0, random_state=42)
+    assert np.allclose(X_oof["qrc_category"].to_numpy(), X_oof2["qrc_category"].to_numpy())
+
+    # The FULL/serving map is still the right thing for a HELD-OUT fold (labels not in the map): a fresh test
+    # frame encodes to the full-map values, and unseen categories fall back to the global mean.
+    X_te = pd.DataFrame({"qrc_category": ["a", "b", "c", "ZZZ"]})
+    te_enc = ef.apply_target_encode(X_te["qrc_category"], full_maps["qrc_category"], gm)
+    assert te_enc.iloc[-1] == pytest.approx(gm)  # unseen -> global mean
+
+
+def test_oof_single_fold_holdout_pulls_toward_global_mean():
+    """A sharper OOF check: for a category whose label is constant (all 1), the full map encodes it near 1.0,
+    while each OOF fold — trained on the OTHER folds — still sees that category as all-1 and also encodes ~1;
+    so instead we verify the MECHANISM: an OOF value for a row never equals the smoothed mean that INCLUDES
+    that row when removing it changes the fold statistics. We use a category with mixed labels split across
+    folds so leave-fold-out changes the estimate."""
+    # 10 rows of category 'm': 5 ones, 5 zeros, deterministically interleaved.
+    cats = ["m"] * 10 + ["other"] * 40
+    labels = ([1, 0] * 5) + list(np.resize([1, 0], 40))
+    X = pd.DataFrame({"qrc_category": cats})
+    y = pd.Series(labels)
+    X_oof = ef.kfold_oof_encode(X, y, ["qrc_category"], n_splits=5, smoothing=0.0, random_state=1)
+    full_maps, gm = ef.compute_target_encode_maps(X, y, ["qrc_category"], smoothing=0.0)
+    # With zero smoothing the full-map value for 'm' is its overall mean (0.5). At least one OOF-encoded 'm'
+    # row must deviate from 0.5, proving the row's own fold was excluded.
+    m_oof = X_oof.loc[X["qrc_category"] == "m", "qrc_category"].to_numpy()
+    assert not np.allclose(m_oof, full_maps["qrc_category"]["m"]), "OOF did not exclude own-fold labels."
+
+
+# --- 12(b): deterministic pre-escalation slicing under TIED timestamps (item 4) ---
+def test_pre_escalation_slice_deterministic_under_tied_timestamps():
+    """Same calls, shuffled input order, tied timestamps -> identical slice + features (call_id tie-break)."""
+    ts = pd.Timestamp("2025-09-01 05:00:00")
+    # Four calls all at the SAME timestamp; the 3rd (by call_id order) escalates.
+    rows = [
+        {"call_id": "c1", "dt": ts, "customer_sentiment": "good", "real_time_alert": "no"},
+        {"call_id": "c2", "dt": ts, "customer_sentiment": "neutral", "real_time_alert": "no"},
+        {"call_id": "c3", "dt": ts, "customer_sentiment": "bad", "real_time_alert": "yes"},
+        {"call_id": "c4", "dt": ts, "customer_sentiment": "bad", "real_time_alert": "no"},
+    ]
+    calls = make_calls(rows)
+
+    rec_ordered = ef.build_ticket_feature_record(calls)
+    # Shuffle the input rows — the deterministic (datetime, call_id) sort must recover the same slice.
+    shuffled = calls.sample(frac=1.0, random_state=123).reset_index(drop=True)
+    rec_shuffled = ef.build_ticket_feature_record(shuffled)
+
+    assert rec_ordered is not None and rec_shuffled is not None
+    # Pre-escalation slice = c1, c2 (strictly before c3). c4 (after) is excluded.
+    assert rec_ordered["num_calls_considered"] == 2
+    assert rec_ordered["is_escalated"] == 1
+    # Every feature must be identical regardless of input order.
+    for k in ef.FEATURE_NAMES:
+        assert rec_ordered[k] == rec_shuffled[k] or (
+            pd.isna(rec_ordered[k]) and pd.isna(rec_shuffled[k])
+        ), f"feature {k} differs under reordering: {rec_ordered[k]} vs {rec_shuffled[k]}"
+    # gl_customer_sentiment over {good, neutral} pre-slice = neutral (bad c3/c4 are excluded).
+    assert rec_ordered["gl_customer_sentiment"] == "neutral"
+
+
+# --- 12(c): split-by-ticket keeps all rows of a ticket in one split + is stable (item 3) ---
+def test_assign_split_by_ticket_stable_and_grouped():
+    ids = pd.Series([f"tkt-{i}" for i in range(2000)])
+
+    s1 = ef.assign_split_by_ticket(ids, seed=42)
+    # Stable across a reordering: same ticket -> same split regardless of row order.
+    reordered = ids.sample(frac=1.0, random_state=99).reset_index(drop=True)
+    s2 = ef.assign_split_by_ticket(reordered, seed=42)
+    map1 = dict(zip(ids, s1))
+    assert all(map1[t] == lab for t, lab in zip(reordered, s2)), "split not stable under reordering"
+
+    # All rows of a given ticket land in ONE split (duplicate the ids and check consistency).
+    dup = pd.concat([ids, ids], ignore_index=True)
+    sd = ef.assign_split_by_ticket(dup, seed=42)
+    dmap = {}
+    for t, lab in zip(dup, sd):
+        assert dmap.setdefault(t, lab) == lab, f"ticket {t} landed in >1 split"
+
+    # No ticket appears in more than one split bucket.
+    buckets = {"train": set(), "val": set(), "test": set()}
+    for t, lab in zip(ids, s1):
+        buckets[lab].add(t)
+    assert not (buckets["train"] & buckets["val"])
+    assert not (buckets["train"] & buckets["test"])
+    assert not (buckets["val"] & buckets["test"])
+
+    # Every split is non-empty and fractions are in the right ballpark for 2000 tickets.
+    fracs = s1.value_counts(normalize=True)
+    assert 0.15 < fracs.get("test", 0) < 0.25
+    assert fracs.get("val", 0) > 0.05
+    assert fracs.get("train", 0) > 0.55
+
+    # A DIFFERENT seed yields a different assignment (the split is genuinely seeded).
+    s3 = ef.assign_split_by_ticket(ids, seed=7)
+    assert not s1.equals(s3)

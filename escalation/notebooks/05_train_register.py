@@ -140,91 +140,130 @@ print(f"n_estimators: {N_ESTIMATORS}  |  scale_pos_weight: {SPW:.3f}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 4. Load gold + reproduce the HPO split exactly
+# MAGIC ## 4. Load gold + reproduce the HPO split exactly (deterministic, by ticket id)
 
 # COMMAND ----------
 
-from sklearn.model_selection import train_test_split
+pdf = spark.table(GOLD_TABLE).toPandas().reset_index(drop=True)
 
-pdf = spark.table(GOLD_TABLE).toPandas()
+# SAME deterministic split as 04_hpo — a ticket's split is a pure function of its id + seed, so the fit/val/
+# test partition is byte-identical across both notebooks regardless of Spark row order (item 3). No same-
+# ticket rows cross splits (gold is one row per ticket). This replaces the old row-position train_test_split.
+_split = ef.assign_split_by_ticket(
+    pdf[ef.ID_COL], test_frac=0.20, val_frac_of_train=0.15, seed=RANDOM_STATE
+)
 X_all = pdf[ef.FEATURE_NAMES].copy()
 y_all = pdf[ef.LABEL_COL].astype(int).copy()
 
-# Identical split to HPO (same seed / stratify) so train/test never mix across the two notebooks.
-X_train, X_test, y_train, y_test = train_test_split(
-    X_all, y_all, test_size=0.20, random_state=RANDOM_STATE, stratify=y_all
-)
-X_fit, X_val, y_fit, y_val = train_test_split(
-    X_train, y_train, test_size=0.15, random_state=RANDOM_STATE, stratify=y_train
-)
-print(f"fit: {len(X_fit):,}  val: {len(X_val):,}  test: {len(X_test):,}")
+X_fit = X_all[_split.values == "train"].reset_index(drop=True)
+y_fit = y_all[_split.values == "train"].reset_index(drop=True)
+X_val = X_all[_split.values == "val"].reset_index(drop=True)
+y_val = y_all[_split.values == "val"].reset_index(drop=True)
+X_test = X_all[_split.values == "test"].reset_index(drop=True)
+y_test = y_all[_split.values == "test"].reset_index(drop=True)
+
+# TRAIN = fit + val (the model is finally fit on both, once the threshold is chosen on val).
+X_train = pd.concat([X_fit, X_val], axis=0).reset_index(drop=True)
+y_train = pd.concat([y_fit, y_val], axis=0).reset_index(drop=True)
+print(f"fit: {len(X_fit):,}  val: {len(X_val):,}  train(fit+val): {len(X_train):,}  test(sealed): {len(X_test):,}")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 5. Fit FROZEN preprocessing on TRAIN, encode all splits
+# MAGIC ## 5. Fit FROZEN preprocessing + build the encoded matrices
+# MAGIC **Leakage discipline (items 1 & 2):**
+# MAGIC * **Serving maps** = FULL-train smoothed target-encoding maps + medians. These are frozen into the
+# MAGIC   pyfunc and are correct for INFERENCE and for encoding held-out folds (val/test) whose labels are NOT
+# MAGIC   in the map. They are NEVER used to encode the training rows the booster sees.
+# MAGIC * **Training matrix** = OUT-OF-FOLD target encodings (a row's own label never enters its own feature).
+# MAGIC   This is what the final booster trains on.
+# MAGIC * **VAL matrix** (for the F2 threshold) = encoded with FIT-ONLY maps (no val labels in the maps).
 
 # COMMAND ----------
 
-# Frozen medians from the FULL train (fit+val) so the served imputer matches what the final model trains on.
+from sklearn.metrics import roc_auc_score
+
+# Frozen medians from the FULL train (fit+val) — the served imputer.
 MEDIANS = ef.compute_medians(X_train, ef.NUMERIC_FEATURES)
 
+# Frozen SERVING target-encoding maps from the FULL train (used at inference + to encode the sealed TEST).
+ENCODE_MAPS, GLOBAL_MEAN = ef.compute_target_encode_maps(
+    X_train, y_train, ef.CATEGORICAL_HIGH_CARD_FEATURES, smoothing=10.0
+)
 
-def _encode(X_ref_tr, y_ref_tr, X_target, encode_maps=None, global_mean=None):
-    """Median-impute + GL-ordinal + target-encode a split. When encode_maps is None, FIT the target encoder
-    on (X_ref_tr, y_ref_tr) and return the maps; otherwise apply the provided (frozen) maps."""
+
+def _base_encode(X_target):
+    """Median-impute + GL-ordinal (both label-free) — the part shared by every split."""
     out = ef.apply_medians(X_target, MEDIANS, ef.NUMERIC_FEATURES)
     for c in ef.CATEGORICAL_GL_FEATURES:
         out[c] = ef.encode_gl_ordinal(X_target[c])
-    if encode_maps is None:
-        # Fit target encoding on the reference train; return maps (train encoded out-of-fold via helper).
-        ref = ef.apply_medians(X_ref_tr, MEDIANS, ef.NUMERIC_FEATURES)
-        for c in ef.CATEGORICAL_GL_FEATURES:
-            ref[c] = ef.encode_gl_ordinal(X_ref_tr[c])
-        ref_enc, out_enc, encode_maps, global_mean = ef.kfold_target_encode(
-            ref, y_ref_tr, out, ef.CATEGORICAL_HIGH_CARD_FEATURES,
-            n_splits=N_FOLDS, smoothing=10.0, random_state=RANDOM_STATE,
-        )
-        return out_enc[ef.FEATURE_NAMES].astype("float32"), encode_maps, global_mean, ref_enc
+    return out
+
+
+def _encode_with_maps(X_target, encode_maps, global_mean):
+    """Apply FROZEN target-encode maps to a held-out split (labels not in the maps)."""
+    out = _base_encode(X_target)
     for c in ef.CATEGORICAL_HIGH_CARD_FEATURES:
         out[c] = ef.apply_target_encode(X_target[c], encode_maps.get(c, {}), global_mean)
     return out[ef.FEATURE_NAMES].astype("float32")
 
 
-# Fit target encoder on the FULL train (fit+val together) → the maps frozen into the model.
-X_train_mat, ENCODE_MAPS, GLOBAL_MEAN, _ = _encode(X_train, y_train, X_train)
-X_val_mat = _encode(X_train, y_train, X_val, ENCODE_MAPS, GLOBAL_MEAN)
-X_test_mat = _encode(X_train, y_train, X_test, ENCODE_MAPS, GLOBAL_MEAN)
-print(f"encoded train: {X_train_mat.shape}  val: {X_val_mat.shape}  test: {X_test_mat.shape}")
+# TRAINING matrix — OUT-OF-FOLD target encodings (item 1). Start from the label-free base, carry the raw
+# high-card strings, then replace them with OOF encodings computed on X_train/y_train.
+_train_base = _base_encode(X_train)
+for c in ef.CATEGORICAL_HIGH_CARD_FEATURES:
+    _train_base[c] = X_train[c]
+_train_oof = ef.kfold_oof_encode(
+    _train_base, y_train, ef.CATEGORICAL_HIGH_CARD_FEATURES,
+    n_splits=N_FOLDS, smoothing=10.0, random_state=RANDOM_STATE,
+)
+X_train_mat = _train_oof[ef.FEATURE_NAMES].astype("float32")
+
+# TEST matrix — frozen SERVING maps (sealed test labels never enter any map).
+X_test_mat = _encode_with_maps(X_test, ENCODE_MAPS, GLOBAL_MEAN)
+print(f"encoded train (OOF): {X_train_mat.shape}  test (serving-maps): {X_test_mat.shape}")
 print(f"global_mean (target-encode fallback): {GLOBAL_MEAN:.4f}")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 6. Fit the final booster (on TRAIN) + choose F2 threshold on VAL
+# MAGIC ## 6. Choose F2 threshold on an INDEPENDENT val, then fit the final booster on TRAIN
 
 # COMMAND ----------
 
 CHAMP_PARAMS = {**XGB_FIXED, "objective": "binary:logistic", "tree_method": "hist", "scale_pos_weight": SPW}
 CHAMP_PARAMS.update(BEST_PARAMS)
 
-# Train on fit portion, pick threshold on VAL (VAL never trains the booster).
-X_fit_mat = _encode(X_train, y_train, X_fit, ENCODE_MAPS, GLOBAL_MEAN)
+# --- Threshold selection on a GENUINELY INDEPENDENT val holdout (item 2) ---
+# The probe trains ONLY on the fit portion, with fit-only encoders: OOF encodings on fit rows and FIT-ONLY
+# target maps on val. No val label enters any map, and the probe never sees val rows. So the val F2 sweep is
+# unbiased.
+_fit_base = _base_encode(X_fit)
+for c in ef.CATEGORICAL_HIGH_CARD_FEATURES:
+    _fit_base[c] = X_fit[c]
+X_fit_mat = ef.kfold_oof_encode(
+    _fit_base, y_fit, ef.CATEGORICAL_HIGH_CARD_FEATURES,
+    n_splits=N_FOLDS, smoothing=10.0, random_state=RANDOM_STATE,
+)[ef.FEATURE_NAMES].astype("float32")
+
+_fit_maps, _fit_gm = ef.compute_target_encode_maps(
+    X_fit, y_fit, ef.CATEGORICAL_HIGH_CARD_FEATURES, smoothing=10.0
+)
+X_val_mat = _encode_with_maps(X_val, _fit_maps, _fit_gm)  # fit-only maps; val labels excluded
+
 dfit = xgb.DMatrix(X_fit_mat.to_numpy(dtype="float32"), label=y_fit.to_numpy(dtype="int32"), feature_names=list(ef.FEATURE_NAMES))
 probe = xgb.train(CHAMP_PARAMS, dfit, num_boost_round=N_ESTIMATORS, verbose_eval=False)
 
 dval = xgb.DMatrix(X_val_mat.to_numpy(dtype="float32"), feature_names=list(ef.FEATURE_NAMES))
 val_proba = probe.predict(dval)
 F2_THRESHOLD, val_f2 = ef.best_f2_threshold(y_val.to_numpy(), val_proba)  # 0.1..0.9 step 0.05
-from sklearn.metrics import roc_auc_score
-
 val_roc_auc = float(roc_auc_score(y_val.to_numpy(), val_proba))
 print(f"VAL F2 threshold: {F2_THRESHOLD:.3f}  (val F2={val_f2:.4f}, val ROC-AUC={val_roc_auc:.4f})")
 
-# Final booster refit on the FULL train (fit+val) for the frozen n_estimators.
+# --- Final booster on the FULL train, using OOF training encodings (item 1) ---
 dtrain = xgb.DMatrix(X_train_mat.to_numpy(dtype="float32"), label=y_train.to_numpy(dtype="int32"), feature_names=list(ef.FEATURE_NAMES))
 champion = xgb.train(CHAMP_PARAMS, dtrain, num_boost_round=N_ESTIMATORS, verbose_eval=False)
-print(f"Champion refit on full train ({len(y_train):,} rows).")
+print(f"Champion fit on full train ({len(y_train):,} rows) with OUT-OF-FOLD target encodings.")
 
 # COMMAND ----------
 
@@ -465,17 +504,32 @@ print(f"Registered {REGISTERED_MODEL_NAME} version {registered_version}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 11. Round-trip check (best-effort, never fails the run)
+# MAGIC ## 11. Round-trip validation — MUST pass before any alias is assigned (item 10)
+# MAGIC Load the freshly-registered pyfunc and predict on the input example. A broken frozen-preprocessing
+# MAGIC package (bad code_paths, missing artifact, encoding mismatch) must ABORT here — a model that cannot
+# MAGIC reproduce its own predictions must never become champion or challenger. So any failure RAISES, and the
+# MAGIC round-trip output must match the locally-computed expected output within tolerance.
 
 # COMMAND ----------
 
-try:
-    _loaded = mlflow.pyfunc.load_model(_model_uri)
-    _rt = _loaded.predict(input_example)
-    assert list(_rt.columns) == ["escalation_probability", "predicted_flag"], _rt.columns
-    print(f"Round-trip OK — columns {list(_rt.columns)} for {_rt.shape[0]} rows.")
-except Exception as _exc:
-    print(f"WARNING: round-trip load/predict did not complete: {_exc}")
+_loaded = mlflow.pyfunc.load_model(_model_uri)
+_rt = _loaded.predict(input_example)
+if list(_rt.columns) != ["escalation_probability", "predicted_flag"]:
+    raise RuntimeError(
+        f"Round-trip failed: registered model returned columns {list(_rt.columns)}, expected "
+        f"['escalation_probability', 'predicted_flag']. Refusing to alias a broken model. FAILING FAST."
+    )
+# The round-trip probabilities must match what we computed locally with the same frozen preprocessing.
+if not np.allclose(
+    _rt["escalation_probability"].to_numpy(),
+    output_example["escalation_probability"].to_numpy(),
+    atol=1e-5,
+):
+    raise RuntimeError(
+        "Round-trip failed: reloaded model's probabilities differ from the locally-computed expected output "
+        "(frozen preprocessing did not survive log/load). Refusing to alias a broken model. FAILING FAST."
+    )
+print(f"Round-trip OK — {_rt.shape[0]} rows, probabilities match local expected output within 1e-5.")
 
 # COMMAND ----------
 
@@ -490,16 +544,31 @@ except Exception as _exc:
 
 from mlflow.exceptions import RestException
 
-_ALIAS_NOT_FOUND_CODE = "RESOURCE_DOES_NOT_EXIST"
+_NOT_FOUND_CODE = "RESOURCE_DOES_NOT_EXIST"
 
 
 def _current_alias_version(client, model_name, alias):
+    """Return the version behind `alias`, or None ONLY when the alias is POSITIVELY absent (item 9).
+
+    `RESOURCE_DOES_NOT_EXIST` is raised both when the ALIAS is missing AND when the whole MODEL is missing, so
+    the raw code is too broad. We first confirm the registered model exists (it must — we just registered a
+    version into it; if it doesn't, that's a real error, so we let it raise). Then a not-found that mentions
+    the alias name is read as "no champion". Anything we can't positively identify as an absent-alias signal
+    (auth / throttle / internal / a not-found that names the MODEL rather than the alias) RE-RAISES — the gate
+    fails closed and never auto-assigns champion on ambiguity.
+    """
+    # Confirm the model exists first — raises RestException(RESOURCE_DOES_NOT_EXIST) naming the MODEL if not,
+    # which we deliberately let propagate (a missing model here is a real bug, not "no champion").
+    client.get_registered_model(model_name)
     try:
         return client.get_model_version_by_alias(model_name, alias).version
     except RestException as exc:
-        if getattr(exc, "error_code", None) == _ALIAS_NOT_FOUND_CODE:
-            return None  # alias genuinely absent -> no current champion
-        raise  # auth / throttle / internal -> fail LOUD, never overwrite blind
+        code = getattr(exc, "error_code", None)
+        msg = str(getattr(exc, "message", "") or exc).lower()
+        # Positively an ABSENT ALIAS: not-found code AND the message references the alias (not the model).
+        if code == _NOT_FOUND_CODE and ("alias" in msg or f"'{alias}'" in msg or alias in msg):
+            return None
+        raise  # anything else -> fail LOUD, never overwrite blind
 
 
 existing_champion = _current_alias_version(_uc_client, REGISTERED_MODEL_NAME, "champion")

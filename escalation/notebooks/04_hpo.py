@@ -8,7 +8,7 @@
 # MAGIC `05_train_register` consumes.
 # MAGIC
 # MAGIC ## Data discipline (no leakage)
-# MAGIC * Read gold `ticket_features`, build the raw 19-feature matrix + `is_escalated` label.
+# MAGIC * Read gold `ticket_features`, build the raw 20-feature matrix + `is_escalated` label.
 # MAGIC * **80/20 stratified** train/test split (seed 42). **TEST is reserved** for `05_train_register`'s honest
 # MAGIC   evaluation and is never seen here.
 # MAGIC * From TRAIN carve **VAL = 15%** (stratified). Preprocessing (median impute, K-Fold target encoding, GL
@@ -120,7 +120,6 @@ print("Experiment set. Model features:", ef.FEATURE_NAMES)
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
 
 pdf = spark.table(GOLD_TABLE).toPandas()
 if ef.LABEL_COL not in pdf.columns or pdf[ef.LABEL_COL].isna().all():
@@ -128,18 +127,21 @@ if ef.LABEL_COL not in pdf.columns or pdf[ef.LABEL_COL].isna().all():
         f"Gold table {GOLD_TABLE} has no usable `{ef.LABEL_COL}` — run 03_gold_features with mode=training first."
     )
 
+# DETERMINISTIC split BY TICKET ID (item 3). A ticket's split is a pure function of its id + seed, so HPO
+# (here) and 05_train_register compute the IDENTICAL fit/val/test partition regardless of Spark row order.
+pdf = pdf.reset_index(drop=True)
+_split = ef.assign_split_by_ticket(
+    pdf[ef.ID_COL], test_frac=0.20, val_frac_of_train=0.15, seed=RANDOM_STATE
+)
 X_all = pdf[ef.FEATURE_NAMES].copy()
 y_all = pdf[ef.LABEL_COL].astype(int).copy()
-print(f"gold rows: {len(pdf):,}  |  positives: {int(y_all.sum()):,} ({y_all.mean():.3%})")
 
-# 80/20 stratified. Test is reserved for 05 (never seen by HPO).
-X_train, X_test, y_train, y_test = train_test_split(
-    X_all, y_all, test_size=0.20, random_state=RANDOM_STATE, stratify=y_all
-)
-# VAL = 15% of train, stratified — this is what each trial is scored on.
-X_fit, X_val, y_fit, y_val = train_test_split(
-    X_train, y_train, test_size=0.15, random_state=RANDOM_STATE, stratify=y_train
-)
+X_fit = X_all[_split.values == "train"].reset_index(drop=True)
+y_fit = y_all[_split.values == "train"].reset_index(drop=True)
+X_val = X_all[_split.values == "val"].reset_index(drop=True)
+y_val = y_all[_split.values == "val"].reset_index(drop=True)
+X_test = X_all[_split.values == "test"].reset_index(drop=True)  # reserved (never seen by HPO)
+print(f"gold rows: {len(pdf):,}  |  positives: {int(y_all.sum()):,} ({y_all.mean():.3%})")
 print(f"fit: {len(X_fit):,}  |  val: {len(X_val):,}  |  test(reserved): {len(X_test):,}")
 
 # scale_pos_weight FIXED from the fit split (spec).
@@ -150,31 +152,40 @@ print(f"scale_pos_weight (fixed, fit neg/pos) = {spw:.3f}")
 
 # MAGIC %md
 # MAGIC ## 4. Preprocess (fit on HPO-fit only) → numeric matrices for XGBoost
+# MAGIC No val labels enter any encoder: numeric medians + GL ordinals + the target-encoding maps are all fit on
+# MAGIC the FIT portion only. The booster trains on OUT-OF-FOLD target encodings (leakage-free); VAL — the fold
+# MAGIC each trial is scored on — is encoded with the fit-only maps and never contributes its labels (item 2).
 
 # COMMAND ----------
 
-# Median impute (frozen medians from fit) on numeric features.
+# Median impute (frozen medians from FIT only) on numeric features.
 medians = ef.compute_medians(X_fit, ef.NUMERIC_FEATURES)
-X_fit_num = ef.apply_medians(X_fit, medians, ef.NUMERIC_FEATURES)
-X_val_num = ef.apply_medians(X_val, medians, ef.NUMERIC_FEATURES)
+X_fit_enc = ef.apply_medians(X_fit, medians, ef.NUMERIC_FEATURES)
+X_val_enc = ef.apply_medians(X_val, medians, ef.NUMERIC_FEATURES)
 
-# GL ordinal encoding (frozen map).
-X_fit_enc = X_fit_num.copy()
-X_val_enc = X_val_num.copy()
+# GL ordinal encoding (label-free map).
 for c in ef.CATEGORICAL_GL_FEATURES:
     X_fit_enc[c] = ef.encode_gl_ordinal(X_fit[c])
     X_val_enc[c] = ef.encode_gl_ordinal(X_val[c])
 
-# K-Fold target encoding for high-card cols: fit on fit split (OOF for fit, full-fit stats for val).
-X_fit_enc, X_val_enc, encode_maps, global_mean = ef.kfold_target_encode(
-    X_fit_enc, y_fit, X_val_enc, ef.CATEGORICAL_HIGH_CARD_FEATURES,
+# High-card target encoding:
+#   * TRAIN (fit) rows -> OUT-OF-FOLD encoding (leakage-free; a row's own label never enters its value).
+#     apply_medians already carried the raw high-card string columns through, so kfold_oof_encode reads them.
+#   * VAL rows         -> fit-only FULL maps (val labels never enter any map).
+X_fit_enc = ef.kfold_oof_encode(
+    X_fit_enc, y_fit, ef.CATEGORICAL_HIGH_CARD_FEATURES,
     n_splits=N_FOLDS, smoothing=10.0, random_state=RANDOM_STATE,
 )
+_fit_maps, _fit_gm = ef.compute_target_encode_maps(
+    X_fit, y_fit, ef.CATEGORICAL_HIGH_CARD_FEATURES, smoothing=10.0
+)
+for c in ef.CATEGORICAL_HIGH_CARD_FEATURES:
+    X_val_enc[c] = ef.apply_target_encode(X_val[c], _fit_maps.get(c, {}), _fit_gm)
 
 # Frozen column order.
 X_fit_mat = X_fit_enc[ef.FEATURE_NAMES].astype("float32")
 X_val_mat = X_val_enc[ef.FEATURE_NAMES].astype("float32")
-print(f"encoded fit matrix: {X_fit_mat.shape}  |  val matrix: {X_val_mat.shape}")
+print(f"encoded fit matrix (OOF): {X_fit_mat.shape}  |  val matrix (fit-maps): {X_val_mat.shape}")
 
 # COMMAND ----------
 

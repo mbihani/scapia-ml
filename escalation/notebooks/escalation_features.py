@@ -41,7 +41,8 @@ import pandas as pd
 # hardcode strings independently.
 # ---------------------------------------------------------------------------
 ID_COL = "ticket_id"
-DATETIME_COL = "call_datetime"
+DATETIME_COL = "call_datetime"  # MUST be a UTC instant (02_silver_clean sets this; IST kept as call_datetime_ist)
+CALL_ID_COL = "call_id"  # true per-call unique key — deterministic secondary sort + silver dedup key
 TARGET_COL = "real_time_alert"  # cleaned: 'yes' / 'no' / 'inconclusive' / None
 LABEL_COL = "is_escalated"
 
@@ -249,8 +250,11 @@ def build_ticket_feature_record(calls: pd.DataFrame, training: bool = True) -> d
     """Aggregate one ticket's calls into a single gold feature row.
 
     Rules (per spec):
-      * Sort calls by `call_datetime`.
-      * Pre-escalation slice: keep only calls BEFORE the first
+      * Sort calls by (`call_datetime`, `call_id`) — the DETERMINISTIC order. The
+        `call_id` secondary key breaks tied timestamps reproducibly, so the
+        pre-escalation boundary does NOT depend on arbitrary Spark input order
+        (item 4). `call_datetime` must be a UTC instant (item 7).
+      * Pre-escalation slice: keep only calls STRICTLY BEFORE the first
         `real_time_alert == 'yes'` call. If a ticket never escalates, all calls
         are used.
       * Exclude tickets whose FIRST call already escalated (pre-slice empty).
@@ -264,7 +268,15 @@ def build_ticket_feature_record(calls: pd.DataFrame, training: bool = True) -> d
     if calls is None or len(calls) == 0:
         return None
 
-    g = calls.sort_values(DATETIME_COL, kind="mergesort").reset_index(drop=True)
+    # Deterministic ordering. Sort by call_datetime, then by call_id as a stable
+    # tie-breaker so two calls sharing a timestamp always order the same way
+    # regardless of the (arbitrary) order Spark handed the group to us. If a
+    # call_id column is somehow absent we fall back to a stable sort on the
+    # timestamp only (mergesort), but call_id is a required silver column.
+    sort_keys = [DATETIME_COL]
+    if CALL_ID_COL in calls.columns:
+        sort_keys.append(CALL_ID_COL)
+    g = calls.sort_values(sort_keys, kind="mergesort").reset_index(drop=True)
     total_calls_in_ticket = len(g)
 
     flags = [to_null(f) for f in g[TARGET_COL].tolist()]
@@ -372,6 +384,69 @@ def apply_medians(X: pd.DataFrame, medians: dict, numeric_features) -> pd.DataFr
     return out
 
 
+def compute_target_encode_maps(X, y, cols, smoothing: float = 10.0, global_mean: float | None = None):
+    """FULL-data smoothed target-encoding maps — the SERVING encoder.
+
+    Returns ``(encode_maps, global_mean)`` where ``encode_maps[col] = {category: smoothed_target_mean}``.
+    Smoothing: ``(n*cat_mean + a*global_mean) / (n + a)``.
+
+    These maps include EVERY row's label, so they are correct for (a) the frozen pyfunc at inference and
+    (b) encoding a held-out fold whose labels are NOT in ``(X, y)``. They MUST NOT be used to encode the same
+    ``(X, y)`` rows the booster trains on — that leaks each row's own label. Use ``kfold_oof_encode`` for
+    training rows (item 1).
+    """
+    if global_mean is None:
+        global_mean = float(y.mean())
+    encode_maps = {}
+    for col in cols:
+        if col not in X.columns:
+            continue
+        stats = (
+            pd.concat([X[col].rename("cat"), y.rename("t")], axis=1)
+            .groupby("cat")["t"]
+            .agg(n="count", s="sum")
+        )
+        stats["smoothed"] = (stats["s"] + smoothing * global_mean) / (stats["n"] + smoothing)
+        encode_maps[col] = {str(k): float(v) for k, v in stats["smoothed"].items()}
+    return encode_maps, float(global_mean)
+
+
+def kfold_oof_encode(
+    X: pd.DataFrame,
+    y: pd.Series,
+    cols,
+    n_splits: int = 5,
+    smoothing: float = 10.0,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """OUT-OF-FOLD smoothed target encoding for TRAINING rows (no leakage).
+
+    Each row's high-cardinality encoding is computed from statistics on the OTHER folds ONLY, so a row's own
+    label never enters its own feature value. This is the matrix the booster must TRAIN on (item 1). Fold
+    smoothing uses the full-``y`` global mean (matches the reference), and unseen categories fall back to it.
+
+    Returns a copy of ``X`` with ``cols`` replaced by their OOF encodings; all other columns are untouched.
+    """
+    from sklearn.model_selection import KFold
+
+    global_mean = float(y.mean())
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    out = X.copy()
+    for col in cols:
+        if col not in X.columns:
+            continue
+        oof = pd.Series(np.nan, index=X.index, dtype="float64")
+        for tr_idx, val_idx in kf.split(X):
+            fold_maps, _ = compute_target_encode_maps(
+                X.iloc[tr_idx], y.iloc[tr_idx], [col], smoothing=smoothing, global_mean=global_mean
+            )
+            oof.iloc[val_idx] = (
+                X.iloc[val_idx][col].astype("object").map(fold_maps[col]).fillna(global_mean)
+            )
+        out[col] = oof.fillna(global_mean)
+    return out
+
+
 def kfold_target_encode(
     X_tr: pd.DataFrame,
     y_tr: pd.Series,
@@ -383,55 +458,61 @@ def kfold_target_encode(
 ):
     """K-Fold target encoding with Bayesian smoothing (ported from reference).
 
-    Train : out-of-fold encoding (each row encoded from the OTHER folds only).
-    Test  : encoded from full-training statistics.
-    Smoothing: (n*cat_mean + a*global_mean) / (n + a).
+    Train : OUT-OF-FOLD encoding (each row encoded from the OTHER folds only) — the leakage-free TRAINING
+            matrix. Delegates to ``kfold_oof_encode``.
+    Test  : encoded from FULL-training statistics (``compute_target_encode_maps``).
 
-    Returns (X_tr_enc, X_te_enc, encode_maps, global_mean). `encode_maps` and
-    `global_mean` are frozen into the pyfunc for inference.
+    Returns ``(X_tr_enc, X_te_enc, encode_maps, global_mean)``. ``encode_maps`` / ``global_mean`` are the
+    FULL-training (serving) maps frozen into the pyfunc; ``X_tr_enc`` carries the OOF encodings used to TRAIN.
     """
-    from sklearn.model_selection import KFold
-
-    global_mean = float(y_tr.mean())
-    kf = KFold(n_splits=n_splits, shuffle=True, random_state=random_state)
-
-    X_tr_enc = X_tr.copy()
+    X_tr_enc = kfold_oof_encode(
+        X_tr, y_tr, cols, n_splits=n_splits, smoothing=smoothing, random_state=random_state
+    )
+    encode_maps, global_mean = compute_target_encode_maps(X_tr, y_tr, cols, smoothing=smoothing)
     X_te_enc = X_te.copy()
-    encode_maps = {}
-
     for col in cols:
         if col not in X_tr.columns:
             continue
-
-        oof = pd.Series(np.nan, index=X_tr.index, dtype="float64")
-        for tr_idx, val_idx in kf.split(X_tr):
-            fold_col = X_tr.iloc[tr_idx][col]
-            fold_y = y_tr.iloc[tr_idx]
-            stats = (
-                pd.concat([fold_col.rename("cat"), fold_y.rename("t")], axis=1)
-                .groupby("cat")["t"]
-                .agg(n="count", s="sum")
-            )
-            stats["smoothed"] = (stats["s"] + smoothing * global_mean) / (
-                stats["n"] + smoothing
-            )
-            oof.iloc[val_idx] = (
-                X_tr.iloc[val_idx][col].map(stats["smoothed"]).fillna(global_mean)
-            )
-        X_tr_enc[col] = oof.fillna(global_mean)
-
-        stats_full = (
-            pd.concat([X_tr[col].rename("cat"), y_tr.rename("t")], axis=1)
-            .groupby("cat")["t"]
-            .agg(n="count", s="sum")
-        )
-        stats_full["smoothed"] = (stats_full["s"] + smoothing * global_mean) / (
-            stats_full["n"] + smoothing
-        )
-        encode_maps[col] = {str(k): float(v) for k, v in stats_full["smoothed"].items()}
         X_te_enc[col] = X_te[col].astype("object").map(encode_maps[col]).fillna(global_mean)
-
     return X_tr_enc, X_te_enc, encode_maps, global_mean
+
+
+def assign_split_by_ticket(
+    ticket_ids,
+    test_frac: float = 0.20,
+    val_frac_of_train: float = 0.15,
+    seed: int = 42,
+):
+    """Deterministic, Spark-order-INDEPENDENT split assignment BY TICKET ID (item 3).
+
+    Returns a pandas Series of ``{'train','val','test'}`` aligned to ``ticket_ids``. A ticket's split is a
+    pure function of its id (stable md5 hash -> [0,1) bucket) and the fractions, so:
+      * the SAME ticket always lands in the SAME split — identical in 04_hpo and 05_train_register, regardless
+        of Spark row order or which notebook runs;
+      * all rows of a ticket share one split (gold is one row/ticket, but this holds even if not);
+      * re-running yields byte-identical assignments (no ``train_test_split`` row-position dependence).
+
+    Test is the sealed lower ``test_frac`` of the hash space. The remaining space is split into val/train with
+    a SECOND, independent hash salt so val selection is orthogonal to the test cut. ``seed`` salts both hashes.
+    Note: this is a hash split, not a stratified one — for the thousands of tickets here the class balance is
+    preserved closely, and determinism/leakage-safety is the priority the review requires.
+    """
+    import hashlib
+
+    def _bucket(value, salt) -> float:
+        h = hashlib.md5(f"{seed}:{salt}:{value}".encode("utf-8")).hexdigest()
+        return int(h[:8], 16) / float(0xFFFFFFFF)
+
+    ids = pd.Series(list(ticket_ids))
+    labels = []
+    for tid in ids:
+        if _bucket(tid, "test") < test_frac:
+            labels.append("test")
+        elif _bucket(tid, "val") < val_frac_of_train:
+            labels.append("val")
+        else:
+            labels.append("train")
+    return pd.Series(labels, index=ids.index)
 
 
 def apply_target_encode(series: pd.Series, encode_map: dict, global_mean: float) -> pd.Series:

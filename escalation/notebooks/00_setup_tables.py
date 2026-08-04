@@ -10,7 +10,7 @@
 # MAGIC | Table | Role |
 # MAGIC |---|---|
 # MAGIC | `greylabs_raw` | Bronze landing zone — one row per call, exact Greylabs export column names (string-typed). Greylabs refreshes this every 5 min. Created empty here only when it does not already exist. |
-# MAGIC | `ticket_status` | Placeholder — `(ticket_id, status, assigned_agent_id, created_at, updated_at)`. Used by inference to keep only `status='open'` tickets. Pipeline degrades gracefully when empty. |
+# MAGIC | `ticket_status` | Placeholder — `(ticket_id, status, assigned_agent, created_at, updated_at)`. Used by inference to keep only `status='open'` tickets. Pipeline degrades gracefully when empty. |
 # MAGIC | `ticket_escalation_predictions` | Inference output — upserted every 5 min by `06_batch_inference`. |
 # MAGIC | `ticket_escalation_feedback` | Phase-2 CX-app feedback loop — human labels on predictions. |
 # MAGIC
@@ -62,6 +62,15 @@ print(f"Schema ready: {CATALOG}.{SCHEMA}")
 # MAGIC ## 3. Bronze `greylabs_raw`
 # MAGIC Exact Greylabs export column names, ALL string-typed (the raw feed sends everything as text). Only created
 # MAGIC when absent — if Greylabs is already writing here live, this is a no-op and the live data is untouched.
+# MAGIC
+# MAGIC **`Transcript` is a REQUIRED source field** (`CONFIGURE`-visible in MANIFESTO). The reference notebook
+# MAGIC derives a per-call unique id as `SHA256(Transcript)`; `02_silver_clean` does the same to produce
+# MAGIC `call_id`, which is (a) the true per-call **dedup key** (two calls sharing a `DateTime` are still
+# MAGIC distinct — item 5) and (b) the deterministic **secondary sort key** for the pre-escalation slice
+# MAGIC (item 4). `02_silver_clean` also **quarantines rows with a null/empty transcript** before dropping the
+# MAGIC transcript text (item 6). If a future Greylabs export truly lacks `Transcript`, supply an alternative
+# MAGIC per-call id column and repoint `CALL_ID_SOURCE` in `02_silver_clean` — do NOT fall back to
+# MAGIC `(ticket_id, DateTime)`, which silently collapses distinct calls.
 
 # COMMAND ----------
 
@@ -71,6 +80,7 @@ spark.sql(
     CREATE TABLE IF NOT EXISTS {RAW_TABLE} (
         `Ticket Id`                                       STRING,
         `DateTime`                                        STRING,
+        `Transcript`                                      STRING,
         `Total Call Duration (In Seconds)`                STRING,
         `Total Non-Speech Duration (In Seconds)`          STRING,
         `Customer Talk Duration (In Seconds)`             STRING,
@@ -115,7 +125,7 @@ spark.sql(
     CREATE TABLE IF NOT EXISTS {STATUS_TABLE} (
         ticket_id          STRING,
         status             STRING,
-        assigned_agent_id  STRING,
+        assigned_agent     STRING,
         created_at         TIMESTAMP,
         updated_at         TIMESTAMP
     ) USING DELTA
@@ -140,11 +150,12 @@ spark.sql(
         escalation_probability  DOUBLE,
         risk_tier               STRING,
         top_features            STRING,
+        shap_status             STRING,
         scored_at               TIMESTAMP,
         model_version           STRING,
         model_alias             STRING
     ) USING DELTA
-    TBLPROPERTIES (comment = 'Per-ticket escalation risk scores. Upserted (MERGE on ticket_id) every 5 min.')
+    TBLPROPERTIES (comment = 'Per-ticket escalation risk scores. Upserted (MERGE on ticket_id) every 5 min. shap_status: OK|FAILED (explanations present?).')
     """
 )
 print(f"Ready: {PRED_TABLE}")

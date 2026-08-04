@@ -35,7 +35,8 @@ job JSONs carry them as literal `CONFIGURE(...)` placeholders you replace at dep
 | `CONFIGURE(risk_tier_high)` | `06_batch_inference`; inference job | `0.7` | Probability ≥ this ⇒ `risk_tier = 'high'`. |
 | `CONFIGURE(risk_tier_medium)` | `06_batch_inference`; inference job | `0.4` | Probability ≥ this (and < high) ⇒ `risk_tier = 'medium'`; else `'low'`. |
 | `CONFIGURE(hpo_n_trials)` | `04_hpo`; training job | `50` | Number of Optuna HPO trials. More trials = better tuning, longer runtime. |
-| `CONFIGURE(n_folds)` | `04_hpo`, `05_train_register`; training job | `5` | K-Fold folds for target encoding of the high-cardinality categoricals. |
+| `CONFIGURE(n_folds)` | `04_hpo`, `05_train_register`; training job | `5` | K-Fold folds for target encoding of the high-cardinality categoricals (OOF training encodings). |
+| `CONFIGURE(shap_failure_mode)` | `06_batch_inference` | `fail` | How a SHAP failure is handled: `fail` (raise — recommended for the scheduled job) or `flag` (write `shap_status='FAILED'` and keep scoring). Never emits empty explanations silently. |
 
 ---
 
@@ -72,7 +73,7 @@ right:
 |---|---|---|
 | `greylabs_raw` | `00_setup_tables` | Bronze landing (Greylabs writes here every ~5 min). |
 | `greylabs_calls_clean` | `02_silver_clean` | Typed, deduped per-call silver. |
-| `ticket_features` | `03_gold_features` | Ticket-grain gold feature table (19 model features + metadata). |
+| `ticket_features` | `03_gold_features` | Ticket-grain gold feature table (20 model features + metadata). |
 | `ticket_status` | `00_setup_tables` | Placeholder — ticket lifecycle status (graceful degrade if empty). |
 | `ticket_escalation_predictions` | `00_setup_tables` (written by `06`) | Per-ticket risk scores, upserted every 5 min. |
 | `ticket_escalation_feedback` | `00_setup_tables` | Phase-2 CX-app feedback loop. |

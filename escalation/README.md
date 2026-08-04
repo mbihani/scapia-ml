@@ -21,7 +21,7 @@ escalation/
 │   ├── 00_setup_tables.py        # create the 4 Delta tables (idempotent)
 │   ├── 01_bronze_ingest.py       # verify bronze freshness (no-op live) / optional backfill
 │   ├── 02_silver_clean.py        # typed, deduped per-call silver (full or incremental)
-│   ├── 03_gold_features.py       # ticket-grain 19-feature gold table (training or inference)
+│   ├── 03_gold_features.py       # ticket-grain 20-feature gold table (training or inference)
 │   ├── 04_hpo.py                 # distributed Optuna HPO (MlflowSparkStudy) -> champion params
 │   ├── 05_train_register.py      # final fit, frozen pyfunc, UC register + fail-closed champion gate
 │   └── 06_batch_inference.py     # 5-min scorer: @champion pyfunc, SHAP top-5, MERGE upsert
@@ -53,7 +53,7 @@ ticket_escalation_predictions   (MERGE upsert on ticket_id)
 
 ---
 
-## The 19 model features (ticket-grain, pre-escalation window only)
+## The 20 model features (ticket-grain, pre-escalation window only)
 
 Only calls **before** the first `real_time_alert='yes'` call feed the features. Tickets whose *first* call
 already escalated are excluded. Label `is_escalated = 1` if **any** call escalated.
@@ -93,23 +93,44 @@ and upserts `ticket_escalation_predictions`.
   pre-window). *(spec + reference)*
 - **Worst-of aggregation.** GL sentiment/quality is summarised by its most-negative call (`bad < neutral <
   good`) — one bad call is the signal, not the average.
-- **K-Fold target encoding.** High-cardinality categories (302 Scapia sub-categories, etc.) are encoded with
-  5-fold out-of-fold target means + Bayesian smoothing (α=10). Maps are **frozen into the pyfunc**; unseen
-  categories fall back to the global mean. Prevents target leakage.
+- **K-Fold target encoding — OOF for training, full maps for serving (no leakage).** High-cardinality
+  categories (302 Scapia sub-categories, etc.) use smoothed target means (Bayesian α=10). The **booster trains
+  on OUT-OF-FOLD encodings** (`kfold_oof_encode`) so a row's own label never enters its own feature. The
+  **full-training maps** (`compute_target_encode_maps`) are what get **frozen into the pyfunc** for inference
+  and are also used to encode held-out folds (val/test), whose labels are not in the maps. Unseen categories
+  fall back to the global mean. This distinction is explicit in code and is guarded by a regression test that
+  fails if training ever uses the full maps.
+- **Deterministic, Spark-order-independent splits + slicing.** The train/val/test split is assigned **by
+  ticket id via a stable hash** (`assign_split_by_ticket`), so 04_hpo and 05_train_register compute the
+  identical partition regardless of Spark row order, and no ticket's rows straddle splits. The pre-escalation
+  slice sorts by `(call_datetime, call_id)` so tied timestamps order reproducibly. All time math is on **UTC
+  instants** (session tz pinned to UTC; IST kept only for display).
+- **True per-call key.** `call_id = SHA256(transcript)` (as in the reference) is the silver **dedup key** — so
+  two genuinely distinct calls sharing a timestamp are never collapsed — and the deterministic tie-break sort
+  key. **Transcript handling:** the Greylabs feed carries a `Transcript` column (bronze), so silver
+  **quarantines rows with a null/empty transcript** (logged with a count) *before* dropping the transcript
+  text. If a future export lacks `Transcript`, repoint `CALL_ID_SOURCE` to another per-call unique column.
 - **Single-source feature logic.** All ticket-grain maths lives in `escalation_features.py` and is invoked in
   Spark via `applyInPandas` (gold) and baked into the pyfunc (inference). The unit tests exercise the **exact**
   production code, not a copy.
-- **Fail-closed champion gate.** A newly trained version takes `@champion` **only** if none exists; otherwise
-  it lands as `@challenger`. Moving `@champion` off a live version requires an explicit human override
-  (`alias_mode=champion` + `force_champion_override=yes`). Only the precise "alias not found" registry error is
-  treated as "no champion" — any other error re-raises. *(ported from `../fop/04`)*
-- **F2 operating threshold.** Chosen on the VAL holdout over 0.1–0.9 (step 0.05), maximizing F2 (β=2, favours
-  recall — missing an escalation costs more than a false alarm). Frozen into the pyfunc as `predicted_flag`.
+- **Fail-closed champion gate + round-trip guard.** A newly trained version takes `@champion` **only** if none
+  exists; otherwise it lands as `@challenger`. Moving `@champion` off a live version requires an explicit human
+  override (`alias_mode=champion` + `force_champion_override=yes`). "No champion" is inferred **only** from a
+  not-found error that positively names the alias (the model's existence is confirmed first); any other error
+  re-raises. Before any alias is assigned, the registered pyfunc is **loaded back and must reproduce its own
+  predictions** — a broken frozen-preprocessing package aborts registration rather than becoming champion.
+  *(ported + hardened from `../fop/04`)*
+- **F2 operating threshold.** Chosen on a **genuinely independent VAL holdout** (probe trained on the fit
+  portion only, val encoded with fit-only maps) over 0.1–0.9 (step 0.05), maximizing F2 (β=2, favours recall —
+  missing an escalation costs more than a false alarm). Frozen into the pyfunc as `predicted_flag`.
 - **Sentiment magnitude.** The silver layer collapses raw `Good/Positive` into a single top bucket and
   `Bad/Negative/Profane` into `bad`; the model treats `good == positive` (rank 2). `neg_sentiment_ratio` adds
   an explicit magnitude signal for how *many* calls turned negative.
-- **SHAP explanations.** `06` unwraps the raw XGBoost booster from the pyfunc and runs `TreeExplainer` to store
-  the top-5 feature contributions per ticket as JSON — so a supervisor sees *why* a ticket is high-risk.
+- **SHAP explanations — fail loud, never silent-empty.** `06` unwraps the raw XGBoost booster from the pyfunc
+  and runs `TreeExplainer` to store the top-5 feature contributions per ticket as JSON. A SHAP failure does
+  **not** emit empty arrays that masquerade as valid: `CONFIGURE(shap_failure_mode)` defaults to `fail` (the
+  scheduled job raises), or `flag` to write `shap_status='FAILED'` so downstream can tell explanations are
+  missing.
 
 ---
 
@@ -124,6 +145,10 @@ pytest escalation/tests/test_features.py -v
 Pure Python (pandas/numpy only) — no Spark, no Databricks runtime. Covers worst-of, pre-escalation slicing,
 first-call exclusion, `neg_sentiment_ratio`, speech ratios, sentiment trend, divide-by-zero guards, QRC casing
 normalization, plus the frozen encoders (target encoding, GL ordinal, model matrix) and F2 threshold selection.
+**Regression tests** (from the cross-vendor review) additionally assert: OOF target encoding excludes each
+row's own label (would fail if training used the full maps — real target leakage), pre-escalation slicing is
+deterministic under tied timestamps (shuffled input → identical slice), and the by-ticket split is stable
+across reorderings with no ticket straddling splits.
 
 ## Status
 ⚠️ **Not yet run live on a Scapia workspace.** Logic is unit-tested locally and every notebook is

@@ -40,17 +40,23 @@ dbutils.widgets.text("schema", "ml_escalation", "Unity Catalog schema (CONFIGURE
 # CONFIGURE(active_ticket_window_hours) — default 8h
 dbutils.widgets.text(
     "active_ticket_window_hours", "8",
-    "Score tickets whose features were computed within N hours (CONFIGURE(active_ticket_window_hours)).",
+    "Score tickets whose LAST CALL is within N hours (CONFIGURE(active_ticket_window_hours)).",
 )
 # CONFIGURE(risk_tier_high) / CONFIGURE(risk_tier_medium)
 dbutils.widgets.text("risk_tier_high", "0.7", "prob >= this -> 'high' (CONFIGURE(risk_tier_high)).")
 dbutils.widgets.text("risk_tier_medium", "0.4", "prob >= this -> 'medium' (CONFIGURE(risk_tier_medium)).")
+# CONFIGURE(shap_failure_mode) — how a SHAP failure is handled (item 11). Default 'fail' (loud).
+dbutils.widgets.dropdown(
+    "shap_failure_mode", "fail", ["fail", "flag"],
+    "SHAP failure handling: 'fail' raises (default, scheduled-job-safe) | 'flag' writes shap_status='FAILED'.",
+)
 
 CATALOG = dbutils.widgets.get("catalog").strip()
 SCHEMA = dbutils.widgets.get("schema").strip()
 ACTIVE_TICKET_WINDOW_HOURS = int(dbutils.widgets.get("active_ticket_window_hours"))
 RISK_TIER_HIGH = float(dbutils.widgets.get("risk_tier_high"))
 RISK_TIER_MEDIUM = float(dbutils.widgets.get("risk_tier_medium"))
+SHAP_FAILURE_MODE = dbutils.widgets.get("shap_failure_mode").strip()
 
 GOLD_TABLE = f"{CATALOG}.{SCHEMA}.ticket_features"
 STATUS_TABLE = f"{CATALOG}.{SCHEMA}.ticket_status"
@@ -126,19 +132,28 @@ print(f"Loaded {REGISTERED_MODEL_NAME}@{CHAMPION_ALIAS} = v{MODEL_VERSION}")
 # COMMAND ----------
 
 from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+
+# UTC session tz so current_timestamp() matches the UTC instants stored in gold (item 7).
+spark.conf.set("spark.sql.session.timeZone", "UTC")
 
 if not spark.catalog.tableExists(GOLD_TABLE):
     raise RuntimeError(f"{GOLD_TABLE} missing. Run 03_gold_features (mode=inference) first. FAILING FAST.")
 
+# "Active" keys on the ticket's LAST-CALL timestamp (a customer called recently), not on when features were
+# computed. last_call_datetime is a UTC instant; compared under a UTC session so both sides agree.
 cutoff = F.current_timestamp() - F.expr(f"INTERVAL {ACTIVE_TICKET_WINDOW_HOURS} HOURS")
-active = spark.table(GOLD_TABLE).filter(F.col("feature_computed_at") >= cutoff)
+active = spark.table(GOLD_TABLE).filter(F.col("last_call_datetime") >= cutoff)
 _n_active = active.count()
-print(f"active tickets (features within {ACTIVE_TICKET_WINDOW_HOURS}h): {_n_active:,}")
+print(f"active tickets (last call within {ACTIVE_TICKET_WINDOW_HOURS}h, UTC): {_n_active:,}")
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## 4. Left join ticket_status → keep open (graceful degrade)
+# MAGIC `ticket_status` may carry multiple rows per ticket (status history). We collapse it to ONE row per
+# MAGIC ticket — the latest by `updated_at` then `created_at` — BEFORE the join (item 8), so the MERGE source
+# MAGIC has exactly one row per ticket and cannot produce duplicate scores or Delta MERGE ambiguity.
 
 # COMMAND ----------
 
@@ -147,9 +162,21 @@ if spark.catalog.tableExists(STATUS_TABLE):
     _status_has_data = spark.table(STATUS_TABLE).limit(1).count() > 0
 
 if _status_has_data:
-    status = spark.table(STATUS_TABLE).select(
-        F.col("ticket_id").alias("_s_ticket_id"),
-        F.lower(F.trim(F.col("status"))).alias("_s_status"),
+    _status_raw = spark.table(STATUS_TABLE)
+    # Deduplicate to one row per ticket: latest by updated_at, then created_at (nulls last), then status text
+    # as a final deterministic tie-break.
+    _dedup_w = Window.partitionBy("ticket_id").orderBy(
+        F.col("updated_at").desc_nulls_last(),
+        F.col("created_at").desc_nulls_last(),
+        F.lower(F.trim(F.col("status"))).asc_nulls_last(),
+    )
+    status = (
+        _status_raw.withColumn("_rn", F.row_number().over(_dedup_w))
+        .filter(F.col("_rn") == 1)
+        .select(
+            F.col("ticket_id").alias("_s_ticket_id"),
+            F.lower(F.trim(F.col("status"))).alias("_s_status"),
+        )
     )
     # Keep tickets that are explicitly 'open'. Unknown-status tickets (null after the left join — the status
     # table only tracks a subset) are kept too so a partial status table never silently drops a live ticket.
@@ -158,7 +185,7 @@ if _status_has_data:
         .filter((F.col("_s_status") == "open") | F.col("_s_status").isNull())
         .drop("_s_ticket_id", "_s_status")
     )
-    print(f"ticket_status present -> filtered to open/unknown tickets: {scored_src.count():,}")
+    print(f"ticket_status present (deduped 1 row/ticket) -> open/unknown tickets: {scored_src.count():,}")
 else:
     print(
         f"WARNING: {STATUS_TABLE} is empty or missing — scoring ALL active tickets (graceful degrade, spec)."
@@ -199,16 +226,24 @@ print(_pdf["risk_tier"].value_counts().to_string())
 # MAGIC ## 6. Top-5 SHAP contributions (TreeExplainer on the UNWRAPPED booster)
 # MAGIC The pyfunc wraps an XGBoost `Booster`; SHAP's `TreeExplainer` needs that raw booster, so we unwrap it
 # MAGIC from the loaded pyfunc and rebuild the SAME frozen model-matrix the model scores on.
+# MAGIC
+# MAGIC **SHAP failures are NOT silently swallowed (item 11).** The contract requires top-5 explanations, so a
+# MAGIC scheduled run must not quietly emit empty arrays that look valid. Behaviour is governed by
+# MAGIC `CONFIGURE(shap_failure_mode)`:
+# MAGIC * `fail` (default) — a SHAP failure RAISES and fails the job loudly (preferred for a scheduled job).
+# MAGIC * `flag` — write predictions with `shap_status='FAILED'` (and empty `top_features`) so downstream can
+# MAGIC   tell explanations are missing; successful rows get `shap_status='OK'`. Chosen only when you would
+# MAGIC   rather keep scoring than page on an explainer outage — the status column makes the gap explicit.
 
 # COMMAND ----------
 
-top_features_json = ["[]"] * len(_pdf)  # default: empty list per row if SHAP is unavailable
+_shap_status = "OK"
+top_features_json = None
 try:
     import shap
 
     # Unwrap the raw XGBoost booster + frozen preprocessing from the loaded pyfunc.
     _impl = champion_pyfunc._model_impl.python_model
-    # load_context is invoked by MLflow at load; the booster/pp are attributes on the impl.
     _booster = _impl._booster
     _pp = _impl._pp
 
@@ -225,16 +260,13 @@ try:
     top_features_json = []
     for i in range(sv.shape[0]):
         row = sv[i]
-        # Top 5 by |contribution|.
-        order = np.argsort(-np.abs(row))[:5]
+        order = np.argsort(-np.abs(row))[:5]  # top 5 by |contribution|
         top = [
             {
                 "feature": feat_names[j],
                 "shap_value": round(float(row[j]), 6),
                 "feature_value": (
-                    None
-                    if pd.isna(X_mat.iloc[i, j])
-                    else round(float(X_mat.iloc[i, j]), 6)
+                    None if pd.isna(X_mat.iloc[i, j]) else round(float(X_mat.iloc[i, j]), 6)
                 ),
             }
             for j in order
@@ -242,9 +274,20 @@ try:
         top_features_json.append(json.dumps(top))
     print(f"SHAP top-5 computed for {len(top_features_json):,} tickets.")
 except Exception as _exc:
-    print(f"WARNING: SHAP attribution skipped ({_exc}); top_features will be empty arrays.")
+    if SHAP_FAILURE_MODE == "flag":
+        print(f"ERROR: SHAP attribution FAILED ({_exc}); writing shap_status='FAILED' (flag mode).")
+        _shap_status = "FAILED"
+        top_features_json = ["[]"] * len(_pdf)
+    else:
+        # Default: fail loudly — do NOT emit empty arrays that masquerade as valid explanations.
+        raise RuntimeError(
+            f"SHAP attribution failed and shap_failure_mode='fail'. Contract requires top-5 explanations for "
+            f"every scored ticket; refusing to write predictions without them. Set shap_failure_mode='flag' "
+            f"to write shap_status='FAILED' instead. Underlying error: {_exc}"
+        )
 
 _pdf["top_features"] = top_features_json
+_pdf["shap_status"] = _shap_status
 
 # COMMAND ----------
 
@@ -257,7 +300,7 @@ from pyspark.sql.types import (
     StructType, StructField, StringType, DoubleType, TimestampType,
 )
 
-out_pdf = _pdf[["ticket_id", "escalation_probability", "risk_tier", "top_features"]].copy()
+out_pdf = _pdf[["ticket_id", "escalation_probability", "risk_tier", "top_features", "shap_status"]].copy()
 out_pdf["model_version"] = MODEL_VERSION
 out_pdf["model_alias"] = CHAMPION_ALIAS
 
@@ -267,6 +310,7 @@ _OUT_SCHEMA = StructType(
         StructField("escalation_probability", DoubleType()),
         StructField("risk_tier", StringType()),
         StructField("top_features", StringType()),
+        StructField("shap_status", StringType()),
         StructField("model_version", StringType()),
         StructField("model_alias", StringType()),
     ]
@@ -278,6 +322,8 @@ out_sdf = spark.createDataFrame(out_pdf, schema=_OUT_SCHEMA).withColumn(
 if not spark.catalog.tableExists(PRED_TABLE):
     raise RuntimeError(f"{PRED_TABLE} missing. Run 00_setup_tables first. FAILING FAST.")
 
+# The MERGE source has exactly one row per ticket_id (gold is one row/ticket and ticket_status was deduped),
+# so this cannot raise Delta's multiple-source-rows-per-key ambiguity error (item 8).
 out_sdf.createOrReplaceTempView("_escalation_scores")
 spark.sql(
     f"""
@@ -288,17 +334,18 @@ spark.sql(
         t.escalation_probability = s.escalation_probability,
         t.risk_tier              = s.risk_tier,
         t.top_features           = s.top_features,
+        t.shap_status            = s.shap_status,
         t.scored_at              = s.scored_at,
         t.model_version          = s.model_version,
         t.model_alias            = s.model_alias
     WHEN NOT MATCHED THEN INSERT (
-        ticket_id, escalation_probability, risk_tier, top_features, scored_at, model_version, model_alias
+        ticket_id, escalation_probability, risk_tier, top_features, shap_status, scored_at, model_version, model_alias
     ) VALUES (
-        s.ticket_id, s.escalation_probability, s.risk_tier, s.top_features, s.scored_at, s.model_version, s.model_alias
+        s.ticket_id, s.escalation_probability, s.risk_tier, s.top_features, s.shap_status, s.scored_at, s.model_version, s.model_alias
     )
     """
 )
-print(f"Upserted {out_pdf.shape[0]:,} predictions into {PRED_TABLE}")
+print(f"Upserted {out_pdf.shape[0]:,} predictions into {PRED_TABLE} (shap_status={_shap_status})")
 
 # COMMAND ----------
 

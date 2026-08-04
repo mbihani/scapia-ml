@@ -55,6 +55,9 @@ SILVER_TABLE = f"{CATALOG}.{SCHEMA}.greylabs_calls_clean"
 
 # IST is UTC+05:30. Greylabs `DateTime` has no tz — it IS local IST wall-clock time.
 IST_ZONE = "Asia/Kolkata"
+# Per-call unique id source (item 5). The reference notebook derives Call_Id = SHA256(Transcript); we do the
+# same. Repoint this to another genuinely per-call unique column if a future export lacks Transcript.
+CALL_ID_SOURCE = "Transcript"
 
 print(f"raw    : {RAW_TABLE}")
 print(f"silver : {SILVER_TABLE}")
@@ -64,28 +67,34 @@ print(f"run_mode: {RUN_MODE}")
 
 # MAGIC %md
 # MAGIC ## 2. Load bronze (optionally windowed for incremental)
+# MAGIC **All time math is standardized on UTC (item 7).** The session timezone is pinned to UTC so
+# MAGIC `current_timestamp()`, every stored timestamp, and the incremental window all agree on a single instant
+# MAGIC scale — no 5.5 h session-tz drift. Greylabs `DateTime` is IST wall-clock, so we convert it to a true UTC
+# MAGIC instant (`call_datetime`, the canonical column used for ordering + active-window math) and also keep the
+# MAGIC IST wall-clock (`call_datetime_ist`) purely for human display.
 
 # COMMAND ----------
 
 from pyspark.sql import functions as F
+
+# Pin session tz to UTC so current_timestamp() and timestamp displays are deterministic on any cluster.
+spark.conf.set("spark.sql.session.timeZone", "UTC")
 
 if not spark.catalog.tableExists(RAW_TABLE):
     raise RuntimeError(f"{RAW_TABLE} missing. Run 00_setup_tables / 01_bronze_ingest first. FAILING FAST.")
 
 raw = spark.table(RAW_TABLE)
 
-# Parse DateTime early — needed both for the incremental window and the silver output.
-# The parsed timestamp is treated as IST wall-clock (no tz shift); we then attach IST as the session-agnostic
-# zone below so the stored value is timezone-correct regardless of the cluster's session tz.
+# Parse the raw IST wall-clock DateTime, then convert to a true UTC instant. to_utc_timestamp interprets the
+# parsed fields as being in IST and returns the equivalent UTC instant (well-defined regardless of session tz).
 raw = raw.withColumn("_call_dt_ist", F.to_timestamp(F.col("`DateTime`"), "dd-MM-yyyy HH:mm:ss"))
+raw = raw.withColumn("_call_dt_utc", F.to_utc_timestamp(F.col("_call_dt_ist"), IST_ZONE))
 
 if RUN_MODE == "incremental":
-    # now() in IST minus the lookback window. from_utc_timestamp(current, IST) gives IST wall clock.
-    cutoff = F.from_utc_timestamp(F.current_timestamp(), IST_ZONE) - F.expr(
-        f"INTERVAL {INFERENCE_LOOKBACK_HOURS} HOURS"
-    )
-    raw = raw.filter(F.col("_call_dt_ist") >= cutoff)
-    print(f"incremental: keeping calls newer than now(IST) - {INFERENCE_LOOKBACK_HOURS}h")
+    # Everything in UTC: keep calls whose UTC instant is newer than (now_utc - N hours).
+    cutoff = F.current_timestamp() - F.expr(f"INTERVAL {INFERENCE_LOOKBACK_HOURS} HOURS")
+    raw = raw.filter(F.col("_call_dt_utc") >= cutoff)
+    print(f"incremental: keeping calls newer than now(UTC) - {INFERENCE_LOOKBACK_HOURS}h")
 
 _n_raw = raw.count()
 print(f"bronze rows in scope : {_n_raw:,}")
@@ -145,9 +154,14 @@ _tid = _clean_str("`Ticket Id`")
 silver = raw.select(
     # ---- identity / time ----
     _tid.alias("ticket_id"),
-    # Attach IST zone so the stored timestamp is timezone-correct (UTC+05:30).
-    F.to_utc_timestamp(F.col("_call_dt_ist"), IST_ZONE).alias("call_datetime_utc"),
-    F.col("_call_dt_ist").alias("call_datetime"),  # IST wall-clock (as parsed)
+    # Per-call unique id = SHA256(transcript) (item 5) — the true dedup key + deterministic tie-break sort key.
+    F.sha2(F.col(f"`{CALL_ID_SOURCE}`").cast("string"), 256).alias("call_id"),
+    # CANONICAL time column = true UTC instant. The feature module orders on this and gold filters on this
+    # (item 7). Kept first so downstream code that references `call_datetime` gets the UTC instant.
+    F.col("_call_dt_utc").alias("call_datetime"),
+    F.col("_call_dt_ist").alias("call_datetime_ist"),  # IST wall-clock — DISPLAY ONLY
+    # Raw transcript kept transiently for the quarantine check below, then dropped before write.
+    F.col(f"`{CALL_ID_SOURCE}`").cast("string").alias("_transcript_raw"),
     # ---- numeric (cast + clamp) ----
     F.col("`Total Call Duration (In Seconds)`").cast("int").alias("total_call_duration"),
     F.greatest(F.col("`Total Non-Speech Duration (In Seconds)`").cast("int"), F.lit(0)).alias(
@@ -186,24 +200,41 @@ silver = raw.select(
     .otherwise(F.lit(None)).alias("repeat_call_flag"),
 )
 
-# Quarantine flag: bad/blank ticket ids.
+# Quarantine flag (item 6): a row is quarantined when it has a bad/blank ticket id OR a null/empty transcript
+# (a null/buggy transcript means no usable call_id and no usable call signal — contract requires dropping such
+# rows). Quarantined rows are KEPT in silver (flagged) but excluded downstream by `NOT is_quarantined`.
+_transcript_clean = F.trim(F.col("_transcript_raw"))
+_bad_transcript = F.col("_transcript_raw").isNull() | (F.length(_transcript_clean) == 0)
 silver = silver.withColumn(
     "is_quarantined",
-    F.col("ticket_id").isNull() | F.col("ticket_id").isin("undefined", "-"),
+    F.col("ticket_id").isNull() | F.col("ticket_id").isin("undefined", "-") | _bad_transcript,
 ).withColumn("ingested_at", F.current_timestamp())
+
+# Log the quarantine breakdown, then drop the transcript text (it is not a model feature).
+_n_bad_tid = silver.filter(
+    F.col("ticket_id").isNull() | F.col("ticket_id").isin("undefined", "-")
+).count()
+_n_bad_transcript = silver.filter(_bad_transcript).count()
+print(f"quarantine: bad_ticket_id={_n_bad_tid:,}  null/empty_transcript={_n_bad_transcript:,}")
+silver = silver.drop("_transcript_raw")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 5. Deduplicate on the natural key `(ticket_id, call_datetime)`
-# MAGIC The grain is one row per call. Keep the most-recently-ingested row per key so a re-scored call replaces
-# MAGIC its earlier version rather than duplicating it.
+# MAGIC ## 5. Deduplicate on the per-call key `call_id`
+# MAGIC The grain is one row per call. Dedup on `call_id` (SHA256 of the transcript — a true per-call id), NOT on
+# MAGIC `(ticket_id, call_datetime)`: two genuinely distinct calls that share a timestamp have different
+# MAGIC transcripts, hence different `call_id`s, so they are preserved (item 5). Ties on the SAME `call_id` are
+# MAGIC true duplicate ingests of one call; we keep one deterministically — ordered by `ingested_at` desc then
+# MAGIC by the stable content columns so the choice does not depend on same-run `ingested_at` collisions.
 
 # COMMAND ----------
 
 from pyspark.sql.window import Window
 
-w = Window.partitionBy("ticket_id", "call_datetime").orderBy(F.col("ingested_at").desc())
+w = Window.partitionBy("call_id").orderBy(
+    F.col("ingested_at").desc(), F.col("call_datetime").asc(), F.col("real_time_alert").asc_nulls_last()
+)
 silver = (
     silver.withColumn("_rn", F.row_number().over(w))
     .filter(F.col("_rn") == 1)
@@ -214,7 +245,8 @@ silver = (
 
 # MAGIC %md
 # MAGIC ## 6. Write silver
-# MAGIC `full` → overwrite. `incremental` → MERGE on the natural key so only recent calls are touched.
+# MAGIC `full` → overwrite. `incremental` → MERGE on `call_id` (the per-call key) so only recent calls are
+# MAGIC touched and distinct same-timestamp calls are never conflated.
 
 # COMMAND ----------
 
@@ -231,12 +263,12 @@ else:
         f"""
         MERGE INTO {SILVER_TABLE} t
         USING _silver_updates s
-        ON t.ticket_id <=> s.ticket_id AND t.call_datetime <=> s.call_datetime
+        ON t.call_id = s.call_id
         WHEN MATCHED THEN UPDATE SET *
         WHEN NOT MATCHED THEN INSERT *
         """
     )
-    print(f"Merged incremental updates into {SILVER_TABLE}")
+    print(f"Merged incremental updates into {SILVER_TABLE} (key: call_id)")
 
 # COMMAND ----------
 
