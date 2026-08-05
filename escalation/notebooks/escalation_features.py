@@ -129,9 +129,24 @@ def normalize_qrc_subcategory(value):
     return s.title()
 
 
-# Null sentinel for content hashing — a distinctive string so NULL != '' != 'NULL'. Must match the literal
-# used in the Spark expression in 02_silver_clean so the notebook and this reference implementation agree.
-CONTENT_HASH_NULL_SENTINEL = " __NULL__ "
+# Structural (is_null, value) type-tag for content hashing (B2). We do NOT use a magic-string NULL sentinel:
+# a field whose ACTUAL value equalled that sentinel (the old " __NULL__ ") would collide with a genuine NULL
+# and a real call could be mis-collapsed as a duplicate. Instead each field is serialized as its (is_null,
+# value) tuple: a NULL is the token ``_HASH_NULL_TAG`` ("1:") and a present value ``v`` is ``_HASH_VALUE_TAG``
+# ("0:") + str(v). A present value's bytes ALWAYS begin with the not-null tag '0'; the NULL token is exactly
+# "1:", so NO non-null string can ever produce the same serialized bytes as a NULL in that field. MUST stay in
+# sync with the identical type-tag in 02_silver_clean (``_tag_field`` — single source of truth; see B2 test).
+_HASH_NULL_TAG = "1:"   # (is_null=1) — the ENTIRE serialized NULL token
+_HASH_VALUE_TAG = "0:"  # (is_null=0) — prefix; the value's str() follows
+
+
+def _tag_field(value) -> str:
+    """Serialize one field as an (is_null, value) type-tag before hashing (B2).
+
+    NULL -> "1:" (is_null true, no value). present v -> "0:" + str(v). No non-null string can equal the NULL
+    token: a present value's bytes always start with '0', the NULL token starts with '1'.
+    """
+    return _HASH_NULL_TAG if value is None else _HASH_VALUE_TAG + str(value)
 
 
 def row_content_hash(row: dict, columns=None) -> str:
@@ -140,7 +155,8 @@ def row_content_hash(row: dict, columns=None) -> str:
     Produces a TRUE TOTAL ORDER over rows: two rows differing in ANY column get different hashes, and only
     rows equal across ALL considered columns collide. Mirrors the Spark expression in 02_silver_clean exactly:
       * columns considered in DETERMINISTIC (sorted) order;
-      * each value canonicalized as its ``str(...)`` with None -> a distinctive null sentinel;
+      * each value serialized as its (is_null, value) type-tag (``_tag_field``) — a NULL can never collide with
+        any non-null string value, unlike a magic-string sentinel (B2);
       * each column value hashed FIRST (fixed-width sha256 hex, no delimiters), then the per-column hashes
         concatenated with '||' and hashed again — per-column hashing removes delimiter-collision ambiguity
         (['a','b||c'] vs ['a||b','c']) that a raw concat would allow.
@@ -153,9 +169,7 @@ def row_content_hash(row: dict, columns=None) -> str:
     cols = sorted(row.keys()) if columns is None else sorted(columns)
     per_col = []
     for c in cols:
-        v = row.get(c)
-        s = CONTENT_HASH_NULL_SENTINEL if v is None else str(v)
-        per_col.append(hashlib.sha256(s.encode("utf-8")).hexdigest())
+        per_col.append(hashlib.sha256(_tag_field(row.get(c)).encode("utf-8")).hexdigest())
     return hashlib.sha256("||".join(per_col).encode("utf-8")).hexdigest()
 
 
@@ -560,39 +574,72 @@ def assign_split_by_ticket(
 # Champion-gate helpers (H4). Pure functions of an MLflow-client-like object so the fail-closed / structural
 # alias-presence logic is unit-testable without a live registry.
 # ---------------------------------------------------------------------------
-def alias_map(registered_model) -> dict:
-    """Extract ``{alias_name: version}`` from a RegisteredModel across MLflow shapes.
+_ALIASES_MISSING = object()  # distinct from a legitimate None value on the attribute
 
-    ``RegisteredModel.aliases`` is a list of RegisteredModelAlias(alias, version) on modern MLflow and a plain
-    ``{alias: version}`` dict on some builds. Normalize both to a dict; anything unexpected -> empty (treated
-    as 'no aliases' — safe, because a champion we cannot see is one we won't overwrite).
+
+def alias_map(registered_model) -> dict:
+    """Extract ``{alias_name: version}`` from a RegisteredModel's alias SET — STRUCTURAL and fail-CLOSED (H4).
+
+    Recognizes EXACTLY the two well-formed MLflow shapes for ``RegisteredModel.aliases``:
+      * a ``{alias: version}`` dict — modern MLflow / UC normalizes to this (an empty ``{}`` when there are no
+        aliases yet);
+      * a list/tuple of ``RegisteredModelAlias(alias, version)``-like objects (older builds), each exposing
+        ``.alias`` and ``.version``.
+    A well-formed EMPTY set (empty dict OR empty list) is LEGITIMATE — it means 'no aliases yet' and returns
+    ``{}`` WITHOUT raising, so the very first @champion promotion (first-registration) is never blocked.
+
+    Anything we cannot PROVE to be a well-formed alias set RAISES ``ValueError`` (fail closed): the ``aliases``
+    attribute is missing or ``None``, is neither a dict nor a list/tuple, or a list element is not a
+    recognizable alias object (missing ``.alias``/``.version``). We must NEVER coerce an unknown/unavailable
+    shape to ``{}`` — an empty map reads as 'no champion' and auto-promotes, which is the H4 fail-open hole.
     """
-    aliases = getattr(registered_model, "aliases", None)
-    if aliases is None:
-        return {}
+    aliases = getattr(registered_model, "aliases", _ALIASES_MISSING)
+    if aliases is _ALIASES_MISSING or aliases is None:
+        raise ValueError(
+            "RegisteredModel has no readable `aliases` attribute (missing/None) — cannot PROVE the champion "
+            "alias is absent. Refusing to read this as 'no champion' (that would fail OPEN and auto-promote). "
+            f"FAILING CLOSED. (got: {aliases!r})"
+        )
     if isinstance(aliases, dict):
         return {str(k): str(v) for k, v in aliases.items()}
-    out = {}
-    for a in aliases:  # list of RegisteredModelAlias-like objects
-        name = getattr(a, "alias", None)
-        ver = getattr(a, "version", None)
-        if name is not None and ver is not None:
+    if isinstance(aliases, (list, tuple)):
+        out = {}
+        for a in aliases:  # each must be a RegisteredModelAlias-like object
+            name = getattr(a, "alias", None)
+            ver = getattr(a, "version", None)
+            if name is None or ver is None:
+                raise ValueError(
+                    "Unrecognized element in RegisteredModel.aliases (missing .alias/.version): "
+                    f"{a!r}. Cannot PROVE champion absence from a malformed alias set. FAILING CLOSED."
+                )
             out[str(name)] = str(ver)
-    return out
+        return out
+    raise ValueError(
+        f"Unexpected RegisteredModel.aliases shape {type(aliases).__name__} ({aliases!r}); expected a dict or a "
+        "list/tuple of alias objects. Cannot PROVE champion absence — refusing to read as 'no champion'. "
+        "FAILING CLOSED."
+    )
 
 
 def resolve_alias_version(client, model_name, alias):
     """Return the version behind ``alias``, or None ONLY when the alias is PROVABLY absent (H4).
 
-    STRUCTURAL, not free-text: fetch the registered model and inspect its alias SET (authoritative on modern
-    MLflow / UC, where ``RegisteredModel.aliases`` is populated). 'No champion' is inferred ONLY when ``alias``
-    is genuinely not in that set; if present, its version is returned directly from the set. ANY exception from
-    fetching the model (missing model, permission, network, a not-found NOT tied to this alias) PROPAGATES —
-    the gate fails closed and never auto-assigns champion on ambiguity. No message parsing is involved, so an
-    error like 'alias lookup failed: model not found' can never be misread as 'no champion'.
+    STRUCTURAL, not free-text, and fail-CLOSED on ambiguity. Fetch the registered model and inspect its alias
+    SET via ``alias_map`` (authoritative on modern MLflow / UC, where ``RegisteredModel.aliases`` is a
+    well-formed — possibly empty — collection). 'No champion' is inferred ONLY when the alias is genuinely
+    absent from a RECOGNIZED, well-formed set; if present, its version is returned directly.
+
+    Fails CLOSED (propagates) on BOTH:
+      * ANY exception from fetching the model (missing model, permission, network, a not-found NOT tied to this
+        alias) — never misread as 'no champion'; AND
+      * an alias set we cannot PROVE to be a well-formed empty/known collection (None / unexpected shape /
+        malformed element) — ``alias_map`` raises rather than coercing to ``{}`` (the H4 fail-open hole).
+    No message parsing is involved, so an error like 'alias lookup failed: model not found' can never be
+    misread as 'no champion'.
     """
     rm = client.get_registered_model(model_name)  # missing model -> propagates (real bug, not "no champion")
-    return alias_map(rm).get(alias)  # present -> its version; provably absent -> None
+    # alias_map raises (fail closed) on any non-well-formed alias set; provably-absent alias -> None.
+    return alias_map(rm).get(alias)  # present -> its version; provably absent from a KNOWN set -> None
 
 
 def apply_target_encode(series: pd.Series, encode_map: dict, global_mean: float) -> pd.Series:

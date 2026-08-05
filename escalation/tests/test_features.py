@@ -577,10 +577,51 @@ def test_content_hash_is_full_row_total_order():
     assert ef.row_content_hash({"x": None}) != ef.row_content_hash({"x": "NULL"})
 
 
+# The exact magic-string the PRE-FIX content hash used to represent NULL before serialization. Hardcoded here
+# (not imported) precisely because the fix REMOVED that constant — a real field value equal to this literal
+# used to collide with a genuine NULL.
+_OLD_NULL_SENTINEL = " __NULL__ "
+
+
+def test_content_hash_null_not_collidable_with_sentinel_string():
+    """B2 tripwire: a genuine NULL must NOT hash the same as a field whose ACTUAL value equals the old
+    magic-string NULL sentinel (" __NULL__ ").
+
+    The old impl serialized NULL as the literal " __NULL__ " and a present value as ``str(value)``, so a real
+    call whose field literally held " __NULL__ " produced IDENTICAL bytes to a NULL in that field and could be
+    mis-collapsed as a duplicate. The (is_null, value) type-tag makes that impossible: NULL -> "1:", present
+    value -> "0:"+value. This assertion FAILS on the old magic-string impl (equal hashes) and PASSES on the
+    type-tag fix.
+    """
+    # Two rows differing ONLY in that field: one a real NULL, the other the literal old-sentinel string.
+    row_null = {"ticket_id": "T1", "note": None}
+    row_literal = {"ticket_id": "T1", "note": _OLD_NULL_SENTINEL}
+    assert ef.row_content_hash(row_null) != ef.row_content_hash(row_literal), (
+        "a genuine NULL collides with a field literally equal to the old magic-string sentinel — dedup could "
+        "mis-collapse a real call as a duplicate (B2)."
+    )
+
+    # Single-field form makes the collision class unambiguous.
+    assert ef.row_content_hash({"x": None}) != ef.row_content_hash({"x": _OLD_NULL_SENTINEL})
+
+    # And it must still hold for the OTHER near-miss null-ish literals (defence in depth).
+    for literal in (_OLD_NULL_SENTINEL, "__NULL__", "1:", "0:", "None", "null"):
+        assert ef.row_content_hash({"x": None}) != ef.row_content_hash({"x": literal}), (
+            f"NULL collided with the literal string {literal!r}"
+        )
+
+    # A field that genuinely holds the sentinel string is still equal to ITSELF (it is a real, hashable value).
+    assert ef.row_content_hash({"x": _OLD_NULL_SENTINEL}) == ef.row_content_hash({"x": _OLD_NULL_SENTINEL})
+
+
 # --- H4 residual: champion gate is STRUCTURAL + fail-closed (no free-text parsing) ---
 class _FakeRegisteredModel:
     def __init__(self, aliases):
-        self.aliases = aliases  # list of objects with .alias/.version, OR a dict, OR None
+        self.aliases = aliases  # list of objects with .alias/.version, OR a dict, OR None/unexpected
+
+
+class _FakeModelNoAliasesAttr:
+    """A model object that has NO `aliases` attribute at all (an unavailable/unexpected shape)."""
 
 
 class _FakeAliasObj:
@@ -604,13 +645,25 @@ class _FakeClient:
 
 
 def test_champion_gate_absent_alias_returns_none():
-    """Alias provably absent from the model's alias SET -> None ('no champion'), without touching the free-text
-    alias lookup path."""
+    """Alias provably absent from a RECOGNIZED, well-formed alias SET -> None ('no champion'), without any
+    free-text parsing."""
     client = _FakeClient(model=_FakeRegisteredModel(aliases=[_FakeAliasObj("challenger", "3")]))
     assert ef.resolve_alias_version(client, "cat.sch.model", "champion") is None
-    # No alias set means no champion either.
-    client_empty = _FakeClient(model=_FakeRegisteredModel(aliases=[]))
-    assert ef.resolve_alias_version(client_empty, "cat.sch.model", "champion") is None
+    # A well-formed set that has OTHER aliases but not champion is still 'no champion' (dict shape).
+    client_dict = _FakeClient(model=_FakeRegisteredModel(aliases={"challenger": "4"}))
+    assert ef.resolve_alias_version(client_dict, "cat.sch.model", "champion") is None
+
+
+def test_champion_gate_wellformed_empty_alias_set_returns_none_first_registration():
+    """FIRST-REGISTRATION path (must NOT be blocked): a model that EXISTS but has a well-formed EMPTY alias set
+    (champion genuinely absent) reads as 'no champion' -> None, WITHOUT raising. This is the legitimate case
+    the fail-closed logic must preserve, distinct from the unknown/None-shape fail-closed cases below.
+    """
+    # Empty list AND empty dict are both well-formed empties -> None, no raise.
+    client_list = _FakeClient(model=_FakeRegisteredModel(aliases=[]))
+    assert ef.resolve_alias_version(client_list, "cat.sch.model", "champion") is None
+    client_dict = _FakeClient(model=_FakeRegisteredModel(aliases={}))
+    assert ef.resolve_alias_version(client_dict, "cat.sch.model", "champion") is None
 
 
 def test_champion_gate_present_alias_returns_version():
@@ -624,9 +677,41 @@ def test_champion_gate_present_alias_returns_version():
     assert ef.resolve_alias_version(client_dict, "cat.sch.model", "champion") == "9"
 
 
-def test_champion_gate_non_alias_error_reraises_fail_closed():
-    """H4: a NON-alias error must RE-RAISE, never be read as 'no champion'. A message that merely mentions
-    'alias' and 'not found' but refers to the MODEL (the old regex hole) must NOT be swallowed."""
+def test_champion_gate_unknown_alias_shape_raises_fail_closed():
+    """H4 TRIPWIRE — reproduces the EXACT fail-open path: the model fetch SUCCEEDS but the alias set is
+    missing / None / an unexpected shape / a malformed element. The gate must RAISE (fail closed), because it
+    cannot PROVE the champion alias is absent.
+
+    This FAILS on the pre-fix code: the old `alias_map` coerced None/unknown shapes to `{}`, so
+    `resolve_alias_version` returned None ('no champion') and the caller AUTO-PROMOTED the new version over a
+    possibly-live (but unreadable) champion. On the fix each of these raises instead of returning None.
+    """
+    # (a) aliases is None (attribute present but null) — the canonical unknown/unavailable shape.
+    client_none = _FakeClient(model=_FakeRegisteredModel(aliases=None))
+    with pytest.raises(ValueError):
+        ef.resolve_alias_version(client_none, "cat.sch.model", "champion")
+
+    # (b) the model object has NO `aliases` attribute at all.
+    client_missing = _FakeClient(model=_FakeModelNoAliasesAttr())
+    with pytest.raises(ValueError):
+        ef.resolve_alias_version(client_missing, "cat.sch.model", "champion")
+
+    # (c) an unexpected TYPE for the alias set (neither dict nor list/tuple of alias objects).
+    for weird in (42, "champion=7", object()):
+        client_weird = _FakeClient(model=_FakeRegisteredModel(aliases=weird))
+        with pytest.raises(ValueError):
+            ef.resolve_alias_version(client_weird, "cat.sch.model", "champion")
+
+    # (d) a list whose element is NOT a recognizable alias object (missing .alias/.version) — malformed set.
+    client_bad_elem = _FakeClient(model=_FakeRegisteredModel(aliases=["champion", "challenger"]))
+    with pytest.raises(ValueError):
+        ef.resolve_alias_version(client_bad_elem, "cat.sch.model", "champion")
+
+
+def test_champion_gate_model_fetch_error_reraises_fail_closed():
+    """A model-FETCH error must RE-RAISE, never be read as 'no champion' — even when its message mentions
+    'alias' and 'not found' (the old free-text-regex hole). Complements the alias-shape tripwire above.
+    """
 
     class _ModelNotFound(RuntimeError):
         pass

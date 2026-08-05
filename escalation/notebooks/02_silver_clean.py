@@ -178,17 +178,29 @@ else:
 # deterministically, and only rows byte-identical across ALL columns collapse. We therefore hash over EVERY
 # source column, not a subset:
 #   * deterministic column order — sort the source column names;
-#   * null-safe canonicalization — coalesce each value to a distinctive sentinel so NULL != '' != 'NULL';
-#   * collision-free composition — hash each column value FIRST (fixed-width 64-char hex, no delimiters), then
-#     concat those per-column hashes in the fixed order. Per-column hashing removes any delimiter-collision
+#   * structural (is_null, value) type-tag per field (B2) — NOT a magic-string sentinel. A NULL serializes to
+#     the token "1:" and a present value ``v`` to "0:"+str(v); a present value's bytes always start with '0'
+#     and the NULL token is exactly "1:", so NO non-null string can ever collide with a genuine NULL (the old
+#     " __NULL__ " sentinel could be mis-matched by a real value equal to that literal). MUST stay in sync with
+#     ``escalation_features._tag_field`` — the single source of truth the B2 test pins.
+#   * collision-free composition — hash each tagged column value FIRST (fixed-width 64-char hex, no delimiters),
+#     then concat those per-column hashes in the fixed order. Per-column hashing removes any delimiter-collision
 #     ambiguity (e.g. ['a','b||c'] vs ['a||b','c']) that a plain concat_ws of raw values would have.
 # Source columns = the bronze columns only (exclude the transient parse helpers _call_dt_ist / _call_dt_utc);
 # the source `DateTime` is among them, so wall-clock content is covered.
-_NULL_SENTINEL = " __NULL__ "  # == escalation_features.CONTENT_HASH_NULL_SENTINEL (kept in sync; see test)
 _SOURCE_COLS = sorted(c for c in raw.columns if c not in ("_call_dt_ist", "_call_dt_utc"))
-_col_hashes = [
-    F.sha2(F.coalesce(F.col(f"`{c}`").cast("string"), F.lit(_NULL_SENTINEL)), 256) for c in _SOURCE_COLS
-]
+
+
+def _tag_field(colname):
+    """(is_null, value) type-tag for one source column (== escalation_features._tag_field).
+
+    NULL -> "1:" ; present v -> "0:"+str(v). No non-null string can equal the NULL token.
+    """
+    c = F.col(f"`{colname}`").cast("string")
+    return F.when(c.isNull(), F.lit("1:")).otherwise(F.concat(F.lit("0:"), c))
+
+
+_col_hashes = [F.sha2(_tag_field(c), 256) for c in _SOURCE_COLS]
 _content_hash = F.sha2(F.concat_ws("||", *_col_hashes), 256)
 
 silver = raw.select(

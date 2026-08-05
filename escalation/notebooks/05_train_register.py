@@ -557,8 +557,11 @@ print(f"Round-trip OK — {_rt.shape[0]} rows; probabilities (atol=1e-5,rtol=0) 
 
 # Structural, fail-closed alias-presence check lives in the shared module (ef.resolve_alias_version) so it is
 # unit-tested without a live registry. It inspects the registered model's alias SET (no free-text parsing):
-# 'no champion' ONLY when the alias is provably absent from that set, else its version; ANY other error
-# (missing model, permission, network, a not-found not tied to this alias) propagates -> fail closed.
+# 'no champion' ONLY when the alias is provably absent from a RECOGNIZED, well-formed (possibly empty) alias
+# set — so the first-ever @champion promotion on a fresh model (empty alias set) is NOT blocked. It fails
+# CLOSED (raises) on BOTH a fetch error (missing model, permission, network, a not-found not tied to this
+# alias) AND an alias set we cannot PROVE well-formed (None / unexpected shape / malformed element): an
+# unknown shape is NEVER coerced to 'no champion' (H4 fail-open hole).
 existing_champion = ef.resolve_alias_version(_uc_client, REGISTERED_MODEL_NAME, "champion")
 
 if ALIAS_MODE == "none":
