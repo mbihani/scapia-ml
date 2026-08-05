@@ -604,11 +604,25 @@ def test_content_hash_null_not_collidable_with_sentinel_string():
     # Single-field form makes the collision class unambiguous.
     assert ef.row_content_hash({"x": None}) != ef.row_content_hash({"x": _OLD_NULL_SENTINEL})
 
-    # And it must still hold for the OTHER near-miss null-ish literals (defence in depth).
-    for literal in (_OLD_NULL_SENTINEL, "__NULL__", "1:", "0:", "None", "null"):
-        assert ef.row_content_hash({"x": None}) != ef.row_content_hash({"x": literal}), (
+    # No non-null string collides with a genuine NULL — near-miss null-ish literals AND the type-tag probe
+    # values that poke directly at the "is_null:value" encoding ("1"/"0"/"1:"/"0:"), the empty string, and a
+    # colon-containing value ("a:b"). The structural encoding already makes these safe; this pins it.
+    _probe_values = [
+        _OLD_NULL_SENTINEL, "__NULL__", "None", "null",  # sentinel look-alikes
+        "1", "0", "1:", "0:", "", "a:b",                  # type-tag encoding probes
+    ]
+    null_hash = ef.row_content_hash({"x": None})
+    for literal in _probe_values:
+        assert null_hash != ef.row_content_hash({"x": literal}), (
             f"NULL collided with the literal string {literal!r}"
         )
+
+    # The probe values are also pairwise DISTINCT from one another (the type-tag never conflates two different
+    # real values — e.g. "1:" must not hash to the NULL token, and "0" must not equal "0:").
+    _probe_hashes = {lit: ef.row_content_hash({"x": lit}) for lit in _probe_values}
+    assert len(set(_probe_hashes.values())) == len(_probe_values), (
+        f"two distinct probe values produced the same hash: {_probe_hashes}"
+    )
 
     # A field that genuinely holds the sentinel string is still equal to ITSELF (it is a real, hashable value).
     assert ef.row_content_hash({"x": _OLD_NULL_SENTINEL}) == ef.row_content_hash({"x": _OLD_NULL_SENTINEL})
@@ -706,6 +720,57 @@ def test_champion_gate_unknown_alias_shape_raises_fail_closed():
     client_bad_elem = _FakeClient(model=_FakeRegisteredModel(aliases=["champion", "challenger"]))
     with pytest.raises(ValueError):
         ef.resolve_alias_version(client_bad_elem, "cat.sch.model", "champion")
+
+
+def test_champion_gate_malformed_dict_entry_raises_fail_closed():
+    """H4 round-5 TRIPWIRE — the alias set is a RECOGNIZED dict (well-formed top-level shape) but contains a
+    MALFORMED ENTRY. The gate must RAISE (fail closed): a corrupt entry means we cannot PROVE the champion
+    alias is absent.
+
+    This FAILS on the round-4 stringify-everything code (`{str(k): str(v) for k, v in aliases.items()}`): a
+    ``None`` version becomes the string ``"None"``, a ``None`` key becomes ``"None"``, an unexpected version
+    type is coerced to its ``str`` — the entry SURVIVES, 'champion' looks provably absent, and the gate returns
+    None ('no champion') -> auto-promote. On the fix each of these raises instead.
+    """
+    # (a) None version — the concrete fail-open: {"challenger": None} -> {"challenger": "None"} on old code.
+    client_none_ver = _FakeClient(model=_FakeRegisteredModel(aliases={"challenger": None}))
+    with pytest.raises(ValueError):
+        ef.resolve_alias_version(client_none_ver, "cat.sch.model", "champion")
+
+    # (b) None key.
+    client_none_key = _FakeClient(model=_FakeRegisteredModel(aliases={None: "3"}))
+    with pytest.raises(ValueError):
+        ef.resolve_alias_version(client_none_key, "cat.sch.model", "champion")
+
+    # (c) non-string / unexpected version type (a dict is neither a str nor an int version).
+    client_weird_ver = _FakeClient(model=_FakeRegisteredModel(aliases={"challenger": {"nested": 1}}))
+    with pytest.raises(ValueError):
+        ef.resolve_alias_version(client_weird_ver, "cat.sch.model", "champion")
+
+    # (d) non-string key (an int alias name is not a real alias name).
+    client_int_key = _FakeClient(model=_FakeRegisteredModel(aliases={7: "3"}))
+    with pytest.raises(ValueError):
+        ef.resolve_alias_version(client_int_key, "cat.sch.model", "champion")
+
+    # (e) a bad entry that COEXISTS with a valid 'champion' — old code would happily return "5" here, but a
+    # corrupt neighbour means the set is untrustworthy, so we still fail closed rather than trust the read.
+    client_mixed = _FakeClient(
+        model=_FakeRegisteredModel(aliases={"champion": "5", "challenger": None})
+    )
+    with pytest.raises(ValueError):
+        ef.resolve_alias_version(client_mixed, "cat.sch.model", "champion")
+
+    # The analogous list-branch soft spot: an element whose .version is None must ALSO raise (not be skipped).
+    client_list_none_ver = _FakeClient(
+        model=_FakeRegisteredModel(aliases=[_FakeAliasObj("challenger", None)])
+    )
+    with pytest.raises(ValueError):
+        ef.resolve_alias_version(client_list_none_ver, "cat.sch.model", "champion")
+
+    # SANITY (preserved contract): a well-formed dict with an int version still resolves — validation does not
+    # over-reject valid data. UC surfaces versions as ints; "champion": 9 -> "9".
+    client_ok_int = _FakeClient(model=_FakeRegisteredModel(aliases={"champion": 9, "challenger": 8}))
+    assert ef.resolve_alias_version(client_ok_int, "cat.sch.model", "champion") == "9"
 
 
 def test_champion_gate_model_fetch_error_reraises_fail_closed():

@@ -577,6 +577,34 @@ def assign_split_by_ticket(
 _ALIASES_MISSING = object()  # distinct from a legitimate None value on the attribute
 
 
+def _validated_alias_entry(name, version):
+    """Validate ONE (alias_name, version) entry, returning ``(str, str)`` or RAISING (H4 fail-closed).
+
+    A well-formed MLflow alias entry has a non-null string alias NAME and a non-null version that MLflow
+    returns as a string or int (UC model versions are integers surfaced as str/int). We do NOT stringify blind:
+    coercing a corrupt entry (a ``None`` version -> ``"None"``, a ``None`` key -> ``"None"``, an unexpected
+    type) would let a malformed set look like a well-formed one and make the champion alias appear PROVABLY
+    ABSENT — the round-5 fail-open hole. Any malformed entry means we cannot prove absence, so we RAISE.
+    """
+    if not isinstance(name, str) or name == "":
+        raise ValueError(
+            f"Malformed alias entry — alias name must be a non-empty string, got {name!r} "
+            f"(version {version!r}). Cannot PROVE champion absence from a corrupt alias set. FAILING CLOSED."
+        )
+    # bool is an int subclass but is never a valid version — exclude it explicitly.
+    if version is None or isinstance(version, bool) or not isinstance(version, (str, int)):
+        raise ValueError(
+            f"Malformed alias entry — version for alias {name!r} must be a non-null string/int, got "
+            f"{version!r} ({type(version).__name__}). Cannot PROVE champion absence. FAILING CLOSED."
+        )
+    if isinstance(version, str) and version == "":
+        raise ValueError(
+            f"Malformed alias entry — version for alias {name!r} is an empty string. Cannot PROVE champion "
+            "absence. FAILING CLOSED."
+        )
+    return str(name), str(version)
+
+
 def alias_map(registered_model) -> dict:
     """Extract ``{alias_name: version}`` from a RegisteredModel's alias SET — STRUCTURAL and fail-CLOSED (H4).
 
@@ -588,10 +616,14 @@ def alias_map(registered_model) -> dict:
     A well-formed EMPTY set (empty dict OR empty list) is LEGITIMATE — it means 'no aliases yet' and returns
     ``{}`` WITHOUT raising, so the very first @champion promotion (first-registration) is never blocked.
 
-    Anything we cannot PROVE to be a well-formed alias set RAISES ``ValueError`` (fail closed): the ``aliases``
-    attribute is missing or ``None``, is neither a dict nor a list/tuple, or a list element is not a
-    recognizable alias object (missing ``.alias``/``.version``). We must NEVER coerce an unknown/unavailable
-    shape to ``{}`` — an empty map reads as 'no champion' and auto-promotes, which is the H4 fail-open hole.
+    Anything we cannot PROVE to be a well-formed alias set RAISES ``ValueError`` (fail closed). That includes:
+      * the ``aliases`` attribute missing / ``None``, or a shape that is neither a dict nor a list/tuple;
+      * ANY malformed ENTRY — a ``None``/non-string alias name, or a ``None``/non-string-or-int version — in
+        EITHER branch. We never stringify-and-continue a corrupt entry (``{"challenger": None}`` must NOT
+        become ``{"challenger": "None"}``), because a surviving bad entry makes the champion alias look
+        provably absent and the gate would auto-promote (the round-5 fail-open hole).
+    Only when EVERY entry validates is the set 'recognized well-formed'; within that, the champion alias being
+    genuinely absent is a legitimate 'no champion'.
     """
     aliases = getattr(registered_model, "aliases", _ALIASES_MISSING)
     if aliases is _ALIASES_MISSING or aliases is None:
@@ -601,18 +633,25 @@ def alias_map(registered_model) -> dict:
             f"FAILING CLOSED. (got: {aliases!r})"
         )
     if isinstance(aliases, dict):
-        return {str(k): str(v) for k, v in aliases.items()}
+        out = {}
+        for k, v in aliases.items():
+            name, ver = _validated_alias_entry(k, v)  # RAISES on any malformed entry (no blind str())
+            out[name] = ver
+        return out
     if isinstance(aliases, (list, tuple)):
         out = {}
         for a in aliases:  # each must be a RegisteredModelAlias-like object
-            name = getattr(a, "alias", None)
-            ver = getattr(a, "version", None)
-            if name is None or ver is None:
+            # getattr default _ALIASES_MISSING distinguishes 'attribute absent' from a legitimate None value;
+            # both are malformed for an alias entry, so _validated_alias_entry raises on either.
+            name = getattr(a, "alias", _ALIASES_MISSING)
+            ver = getattr(a, "version", _ALIASES_MISSING)
+            if name is _ALIASES_MISSING or ver is _ALIASES_MISSING:
                 raise ValueError(
                     "Unrecognized element in RegisteredModel.aliases (missing .alias/.version): "
                     f"{a!r}. Cannot PROVE champion absence from a malformed alias set. FAILING CLOSED."
                 )
-            out[str(name)] = str(ver)
+            vname, vver = _validated_alias_entry(name, ver)  # RAISES on None/non-str name or bad version
+            out[vname] = vver
         return out
     raise ValueError(
         f"Unexpected RegisteredModel.aliases shape {type(aliases).__name__} ({aliases!r}); expected a dict or a "
